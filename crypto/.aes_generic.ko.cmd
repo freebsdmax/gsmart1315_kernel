@@ -1,0 +1,1 @@
+cmd_crypto/aes_generic.ko := /media/android_source/CyanogenMod/system/prebuilt/linux-x86/toolchain/arm-eabi-4.4.0/bin/arm-eabi-ld -EL -r  -T /media/android_source/qrd-gb-dsds-7225/kernel/scripts/module-common.lds --build-id -o crypto/aes_generic.ko crypto/aes_generic.o crypto/aes_generic.mod.o

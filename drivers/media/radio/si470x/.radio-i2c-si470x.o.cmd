@@ -1,0 +1,1 @@
+cmd_drivers/media/radio/si470x/radio-i2c-si470x.o := /media/android_source/CyanogenMod/system/prebuilt/linux-x86/toolchain/arm-eabi-4.4.0/bin/arm-eabi-ld -EL    -r -o drivers/media/radio/si470x/radio-i2c-si470x.o drivers/media/radio/si470x/radio-si470x-i2c.o drivers/media/radio/si470x/radio-si470x-common.o 

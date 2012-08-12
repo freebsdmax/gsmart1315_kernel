@@ -1,0 +1,62 @@
+#
+# Sensor strange devices
+#
+
+menuconfig SENSORS_DEVICES
+	bool "Sensors devices"
+	default y
+	---help---
+	  Say Y here to get to see options for device drivers from various
+	  different categories. This option alone does not add any kernel code.
+
+	  If you say N, all options in this submenu will be skipped and disabled.
+
+if SENSORS_DEVICES
+
+config INPUT_AL3003
+        tristate "Lite-On Semiconductor AL3003 Light & Proximity Sensor"
+        depends on I2C
+
+config INPUT_BMA220
+        tristate "Bosch Sensortec BMA220 G-Sensor"
+        depends on I2C
+
+config INPUT_BMA220_POSITION
+        int "BMA220 Mounting Position on Board"
+        depends on INPUT_BMA220
+        default "0"
+        help
+          Chip mounting position (pin 1).
+            0: top, upper-left
+            1: top, upper-right
+            2: top, lower-right
+            3: top, lower-left
+            4: bottom, upper-left
+            5: bottom, upper-right
+            6: bottom, lower-right
+            7: bottom, lower-left
+
+config INPUT_YAS529
+        tristate "Yamaha YAS529 Geomagnetic Sensor"
+        depends on I2C
+
+config INPUT_YAS529_POSITION
+        int "YAS529 Mounting Position on Board"
+        depends on INPUT_YAS529
+        default "0"
+        help
+          Chip mounting position (pin 1).
+            0: top, upper-left (7x27)
+            1: top, upper-right (7x25)
+            2: top, lower-right
+            3: top, lower-left
+            4: bottom, upper-right
+            5: bottom, upper-left
+            6: bottom, lower-left
+            7: bottom, lower-right
+
+config INPUT_ORIENTATION
+        tristate "Yamaha Orientation Sensor"
+        depends on I2C
+
+endif # SENSOR_DEVICES

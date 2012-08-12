@@ -1,0 +1,1 @@
+cmd_drivers/misc/sensors/built-in.o :=  /media/android_source/CyanogenMod/system/prebuilt/linux-x86/toolchain/arm-eabi-4.4.0/bin/arm-eabi-ld -EL    -r -o drivers/misc/sensors/built-in.o drivers/misc/sensors/yas529.o drivers/misc/sensors/orientation.o drivers/misc/sensors/bma220.o drivers/misc/sensors/bma220_driver.o drivers/misc/sensors/al3003.o 

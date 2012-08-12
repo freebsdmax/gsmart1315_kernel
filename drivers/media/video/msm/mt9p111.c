@@ -1,0 +1,4626 @@
+/*
+    Copyright (C) 2011 HISENSE COMPANY LIMITED.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met
+    1. Redistributions of source code must retain the above copyright
+         notice, this list of conditions and the following disclaimer.
+    2. Redistributions in binary form must reproduce the above copyright
+         notice, this list of conditions and the following disclaimer in the
+         documentation andor other materials provided with the distribution.
+    3. For alternatively licensed, multiple-licensed(dual-licensed, tri-licensed) , 
+       this software is distributed under the terms of BSD license. 
+    4. Neither the name of HISENSE COMPANY LIMITED nor
+         the names of its contributors may be used to endorse or promote
+         products derived from this software without specific prior written
+         permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS AS IS
+   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+   IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NON-INFRINGEMENT ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+   OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+ 
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/types.h>
+#include <linux/i2c.h>
+#include <linux/uaccess.h>
+#include <linux/miscdevice.h>
+#include <media/msm_camera.h>
+#include <mach/gpio.h>
+#include <mach/camera.h>
+
+
+#define CONFIG_MT9P111_DEBUG
+
+#ifdef CONFIG_MT9P111_DEBUG
+#define MT9P111_DBG(fmt, args...) printk(KERN_INFO fmt, ##args)
+#else
+#define MT9P111_DBG(fmt, args...) do { } while (0)
+#endif
+
+/* Micron MT9P111 Registers and their values */
+/* Sensor Core Registers */
+#define  REG_MT9P111_MODEL_ID          0x0000
+#define  MT9P111_MODEL_ID              0x2880
+#define  REG_MT9P111_ADDR_ACESS        0x098E
+#define  REG_MT9P111_TAGET_BRIGHTNESS  0xA409
+#define  REG_MT9P111_REAL_BRIGHTNESS   0xB804
+#define  REG_MT9P111_AF_STATUS         0xB000
+#define  MT9P111_AF_STATUS_OK          0x0010
+
+#define MT_Null      (0)
+#define MT_True      (1)
+#define MT_False     (0)
+
+static bool MT9P111_CSI_CONFIG;
+
+
+static int g_isFlash = MT_False;
+static int g_flashAuto = MT_False;
+static struct timer_list flash_timer;
+
+static bool g_AutoFocus = MT_True;
+
+struct mt9p111_work {
+	struct work_struct work;
+};
+
+static struct  mt9p111_work *mt9p111_sensorw;
+static struct  i2c_client *mt9p111_client;
+
+struct mt9p111_ctrl {
+	const struct msm_camera_sensor_info *sensordata;
+};
+
+static struct mt9p111_ctrl *mt9p111_ctrl;
+
+static DECLARE_WAIT_QUEUE_HEAD(mt9p111_wait_queue);
+//DECLARE_MUTEX(mt9p111_sem);
+DEFINE_MUTEX(mt9p111_mut);
+static int16_t mt9p111_effect = CAMERA_EFFECT_OFF;
+static int16_t mt9p111_afops = AUTO;
+static int16_t mt9p111_iso = CAMERA_ISO_AUTO;
+static int16_t mt9p111_exposure_mode = CAMERA_AEC_FRAME_AVERAGE;
+static int16_t mt9p111_exposure_type = CAMERA_EXPOSURE_0;
+static int16_t mt9p111_scene = CAMERA_BESTSHOT_OFF;
+static int16_t mt9p111_brightness = CAMERA_BRIGHTNESS_MIDDLE;
+static int16_t mt9p111_afrect = AUTO;
+static int16_t mt9p111_sharpness = CAMERA_SHARPNESS_DEFAULT;
+static int16_t mt9p111_saturation = CAMERA_SATURATION_0;
+static int16_t mt9p111_antibanding = CAMERA_ANTIBANDING_AUTO;
+static int16_t mt9p111_fps = CAMERA_FPS_VARIABLE;
+static int16_t mt9p111_reflect = CAMERA_REFLECT_NONE;
+static int16_t mt9p111_contrast = CAMERA_CONTRAST_0;
+static int16_t mt9p111_white_balance = CAMERA_WB_AUTO;
+
+enum mt9p111_width {
+	WORD_LEN,
+	BYTE_LEN
+};
+struct mt9p111_i2c_reg_conf {
+	unsigned short waddr;
+	unsigned short wdata;
+    enum mt9p111_width width;
+	unsigned short mdelay_time;
+};
+
+enum mt9p111_setting {
+	RES_PREVIEW,
+	RES_CAPTURE
+};
+enum mt9p111_reg_update {
+	/* Sensor egisters that need to be updated during initialization */
+	REG_INIT,
+	/* Sensor egisters that needs periodic I2C writes */
+	UPDATE_PERIODIC,
+	/* All the sensor Registers will be updated */
+	UPDATE_ALL,
+	/* Not valid update */
+	UPDATE_INVALID
+};
+
+extern int config_camera_ctrl_flash(int flag);
+/*=============================================================
+	REGISTER TABLE
+=============================================================*/
+struct mt9p111_i2c_reg_conf mt9p111_reg_init_tab[] = 
+{
+    {0x0010, 0x0340, WORD_LEN, 0}, 	// PLL_DIVIDERS
+    {0x0012, 0x0090, WORD_LEN, 0}, 	// PLL_P_DIVIDERS
+    {0x0014, 0x2025, WORD_LEN, 0}, 	// PLL_CONTROL
+    {0x001E, 0x0665, WORD_LEN, 0}, 	// PAD_SLEW_PAD_CONFIG
+    {0x0022, 0x0030, WORD_LEN, 0},  // 1E0 	// VDD_DIS_COUNTER
+    {0x002A, 0x7F7F, WORD_LEN, 0}, 	// PLL_P4_P5_P6_DIVIDERS
+    {0x002C, 0x0000, WORD_LEN, 0},
+    {0x002E, 0x0000, WORD_LEN, 0},	
+    {0x0018, 0x4008, WORD_LEN, 100},	//10}, 	// STANDBY_CONTROL_AND_STATUS
+    //POLL_REG= 0x0018,0xE07F,!=0x2008,DELAY=10,TIMEOUT=100	//Wait for the core ready
+    {0x0010, 0x0340, WORD_LEN, 0}, 	// PLL_DIVIDERS
+    //timing_settings_12.2~8fps
+    {0x098E, 0x483A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS
+    {0xC83A, 0x000C, WORD_LEN, 0}, 	// CAM_CORE_A_Y_ADDR_START
+    {0xC83C, 0x0018, WORD_LEN, 0}, 	// CAM_CORE_A_X_ADDR_START
+    {0xC83E, 0x07B1, WORD_LEN, 0}, 	// CAM_CORE_A_Y_ADDR_END
+    {0xC840, 0x0A45, WORD_LEN, 0}, 	// CAM_CORE_A_X_ADDR_END
+    {0xC842, 0x0001, WORD_LEN, 0}, 	// CAM_CORE_A_ROW_SPEED
+    {0xC844, 0x0103, WORD_LEN, 0}, 	// CAM_CORE_A_SKIP_X_CORE
+    {0xC846, 0x0103, WORD_LEN, 0}, 	// CAM_CORE_A_SKIP_Y_CORE
+    {0xC848, 0x0103, WORD_LEN, 0}, 	// CAM_CORE_A_SKIP_X_PIPE
+    {0xC84A, 0x0103, WORD_LEN, 0}, 	// CAM_CORE_A_SKIP_Y_PIPE
+    {0xC84C, 0x0096, WORD_LEN, 0}, 	// CAM_CORE_A_POWER_MODE [101124 적용] 0x00F6-> 0x0096
+    {0xC84E, 0x0001, WORD_LEN, 0}, 	// CAM_CORE_A_BIN_MODE
+    {0xC850, 0x00,   BYTE_LEN, 0}, 	// CAM_CORE_A_ORIENTATION
+    {0xC851, 0x00,   BYTE_LEN, 0}, 	// CAM_CORE_A_PIXEL_ORDER
+    {0xC852, 0x019C, WORD_LEN, 0}, 	// CAM_CORE_A_FINE_CORRECTION
+    {0xC854, 0x0732, WORD_LEN, 0}, 	// CAM_CORE_A_FINE_ITMIN
+    {0xC858, 0x0000, WORD_LEN, 0}, 	// CAM_CORE_A_COARSE_ITMIN
+    {0xC85A, 0x0001, WORD_LEN, 0}, 	// CAM_CORE_A_COARSE_ITMAX_MARGIN
+    {0xC85C, 0x0423, WORD_LEN, 0}, 	// CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+    {0xC85E, 0xFFFF, WORD_LEN, 0}, 	// CAM_CORE_A_MAX_FRAME_LENGTH_LINES
+    {0xC860, 0x0423, WORD_LEN, 0}, 	// CAM_CORE_A_BASE_FRAME_LENGTH_LINES
+    {0xC862, 0x1194, WORD_LEN, 0}, 	// CAM_CORE_A_MIN_LINE_LENGTH_PCLK
+    {0xC864, 0xFFFE, WORD_LEN, 0}, 	// CAM_CORE_A_MAX_LINE_LENGTH_PCLK
+    {0xC866, 0x7F7F, WORD_LEN, 0}, 	// CAM_CORE_A_P4_5_6_DIVIDER
+    {0xC868, 0x0423, WORD_LEN, 0}, 	// CAM_CORE_A_FRAME_LENGTH_LINES
+    {0xC86A, 0x1194, WORD_LEN, 0}, 	// CAM_CORE_A_LINE_LENGTH_PCK
+    {0xC86C, 0x0518, WORD_LEN, 0}, 	// CAM_CORE_A_OUTPUT_SIZE_WIDTH
+    {0xC86E, 0x03D4, WORD_LEN, 0}, 	// CAM_CORE_A_OUTPUT_SIZE_HEIGHT
+    {0xC870, 0x0014, WORD_LEN, 0}, 	// CAM_CORE_A_RX_FIFO_TRIGGER_MARK
+    {0xC858, 0x0002, WORD_LEN, 0}, 	// CAM_CORE_A_COARSE_ITMIN
+    {0xC8B8, 0x0004, WORD_LEN, 0}, 	// CAM_OUTPUT_0_JPEG_CONTROL
+    {0xC8AE, 0x0001, WORD_LEN, 0}, 	// CAM_OUTPUT_0_OUTPUT_FORMAT
+    {0xC8AA, 0x0280, WORD_LEN, 0},	//500 	// CAM_OUTPUT_0_IMAGE_WIDTH
+    {0xC8AC, 0x01E0, WORD_LEN, 0},	//3C0 	// CAM_OUTPUT_0_IMAGE_HEIGHT
+    //[Full_Res_Settings_JPEG_Fullspeed]
+    //;Max Framerate in Full Res
+    {0x098E, 0x4872, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS
+    {0xC872, 0x0010, WORD_LEN, 0}, 	// CAM_CORE_B_Y_ADDR_START
+    {0xC874, 0x001C, WORD_LEN, 0}, 	// CAM_CORE_B_X_ADDR_START
+    {0xC876, 0x07AF, WORD_LEN, 0}, 	// CAM_CORE_B_Y_ADDR_END
+    {0xC878, 0x0A43, WORD_LEN, 0}, 	// CAM_CORE_B_X_ADDR_END
+    {0xC87A, 0x0001, WORD_LEN, 0}, 	// CAM_CORE_B_ROW_SPEED
+    {0xC87C, 0x0101, WORD_LEN, 0}, 	// CAM_CORE_B_SKIP_X_CORE
+    {0xC87E, 0x0101, WORD_LEN, 0}, 	// CAM_CORE_B_SKIP_Y_CORE
+    {0xC880, 0x0101, WORD_LEN, 0}, 	// CAM_CORE_B_SKIP_X_PIPE
+    {0xC882, 0x0101, WORD_LEN, 0}, 	// CAM_CORE_B_SKIP_Y_PIPE
+    {0xC884, 0x005C, WORD_LEN, 0}, 	// CAM_CORE_B_POWER_MODE [101124 적용] 0x00F2-> 0x005C
+    {0xC886, 0x0000, WORD_LEN, 0}, 	// CAM_CORE_B_BIN_MODE
+    {0xC888, 0x00,   BYTE_LEN, 0}, 	// CAM_CORE_B_ORIENTATION
+    {0xC889, 0x00,   BYTE_LEN, 0}, 	// CAM_CORE_B_PIXEL_ORDER
+    {0xC88A, 0x009C, WORD_LEN, 0}, 	// CAM_CORE_B_FINE_CORRECTION
+    {0xC88C, 0x034A, WORD_LEN, 0}, 	// CAM_CORE_B_FINE_ITMIN
+    {0xC890, 0x0000, WORD_LEN, 0}, 	// CAM_CORE_B_COARSE_ITMIN
+    {0xC892, 0x0001, WORD_LEN, 0}, 	// CAM_CORE_B_COARSE_ITMAX_MARGIN
+    {0xC894, 0x07EF, WORD_LEN, 0}, 	// CAM_CORE_B_MIN_FRAME_LENGTH_LINES
+    {0xC896, 0xFFFF, WORD_LEN, 0}, 	// CAM_CORE_B_MAX_FRAME_LENGTH_LINES
+    {0xC898, 0x082F, WORD_LEN, 0}, 	// CAM_CORE_B_BASE_FRAME_LENGTH_LINES
+    {0xC89A, 0x1964, WORD_LEN, 0}, 	// CAM_CORE_B_MIN_LINE_LENGTH_PCLK
+    {0xC89C, 0xFFFE, WORD_LEN, 0}, 	// CAM_CORE_B_MAX_LINE_LENGTH_PCLK
+    {0xC89E, 0x7F7F, WORD_LEN, 0}, 	// CAM_CORE_B_P4_5_6_DIVIDER
+    {0xC8A0, 0x07EF, WORD_LEN, 0}, 	// CAM_CORE_B_FRAME_LENGTH_LINES
+    {0xC8A2, 0x1964, WORD_LEN, 0}, 	// CAM_CORE_B_LINE_LENGTH_PCK
+    {0xC8A4, 0x0A28, WORD_LEN, 0}, 	// CAM_CORE_B_OUTPUT_SIZE_WIDTH
+    {0xC8A6, 0x07A0, WORD_LEN, 0}, 	// CAM_CORE_B_OUTPUT_SIZE_HEIGHT
+    {0xC8A8, 0x0124, WORD_LEN, 0}, 	// CAM_CORE_B_RX_FIFO_TRIGGER_MARK
+    {0xC890, 0x0002, WORD_LEN, 0}, 	// CAM_CORE_B_COARSE_ITMIN
+    {0xC8C0, 0x0A20, WORD_LEN, 0}, 	// CAM_OUTPUT_1_IMAGE_WIDTH
+    {0xC89A, 0x1964, WORD_LEN, 0}, 	// CAM_CORE_B_MIN_LINE_LENGTH_PCLK
+    {0xC8A2, 0x1964, WORD_LEN, 0}, 	// CAM_CORE_B_LINE_LENGTH_PCK
+    {0xC8C4, 0x0001, WORD_LEN, 0}, 	// CAM_OUTPUT_1_OUTPUT_FORMAT
+    {0xC8C6, 0x0000, WORD_LEN, 0}, 	// CAM_OUTPUT_1_OUTPUT_FORMAT_ORDER
+    {0xC8CE, 0x0014, WORD_LEN, 0}, 	// CAM_OUTPUT_1_JPEG_CONTROL
+    {0xD822, 0x4610, WORD_LEN, 0}, 	// JPEG_JPSS_CTRL_VAR
+    {0x3330, 0x0000, WORD_LEN, 0}, 	// OUTPUT_FORMAT_TEST
+    //[Flicker]
+    {0xA010, 0x00CC, WORD_LEN, 0}, 	// FD_MIN_EXPECTED50HZ_FLICKER_PERIOD
+    {0xA012, 0x00E0, WORD_LEN, 0}, 	// FD_MAX_EXPECTED50HZ_FLICKER_PERIOD
+    {0xA014, 0x00A8, WORD_LEN, 0}, 	// FD_MIN_EXPECTED60HZ_FLICKER_PERIOD
+    {0xA016, 0x00BC, WORD_LEN, 0}, 	// FD_MAX_EXPECTED60HZ_FLICKER_PERIOD
+    {0xA018, 0x00D6, WORD_LEN, 0}, 	// FD_EXPECTED50HZ_FLICKER_PERIOD_IN_CONTEXT_A
+    {0xA01A, 0x0095, WORD_LEN, 0}, 	// FD_EXPECTED50HZ_FLICKER_PERIOD_IN_CONTEXT_B
+    {0xA01C, 0x00B2, WORD_LEN, 0}, 	// FD_EXPECTED60HZ_FLICKER_PERIOD_IN_CONTEXT_A
+    {0xA01E, 0x007C, WORD_LEN, 0}, 	// FD_EXPECTED60HZ_FLICKER_PERIOD_IN_CONTEXT_B                                                     
+    //[k28a_rev3_FW_patch7]
+    //; NEW Patch_AF
+    //  k28a_rev03_patch07_CR30221_AWB_AFNOISE_YOFFSET_APGA_REV6
+    {0x0982, 0x0000, WORD_LEN, 0}, 	// ACCESS_CTL_STAT
+    {0x098A, 0x0000, WORD_LEN, 0}, 	// PHYSICAL_ADDRESS_ACCESS
+    {0x886C, 0xC0F1, WORD_LEN, 0},
+    {0x886E, 0xC5E1, WORD_LEN, 0},
+    {0x8870, 0x246A, WORD_LEN, 0},
+    {0x8872, 0x1280, WORD_LEN, 0},
+    {0x8874, 0xC4E1, WORD_LEN, 0},
+    {0x8876, 0xD30E, WORD_LEN, 0},
+    {0x8878, 0x2069, WORD_LEN, 0},
+    {0x887A, 0x0000, WORD_LEN, 0},
+    {0x887C, 0x1305, WORD_LEN, 0},
+    {0x887E, 0x0084, WORD_LEN, 0},
+    {0x8880, 0x1730, WORD_LEN, 0},
+    {0x8882, 0x7005, WORD_LEN, 0},
+    {0x8884, 0xD801, WORD_LEN, 0},
+    {0x8886, 0x8B41, WORD_LEN, 0},
+    {0x8888, 0xD900, WORD_LEN, 0},
+    {0x888A, 0x0D5E, WORD_LEN, 0},
+    {0x888C, 0x0664, WORD_LEN, 0},
+    {0x888E, 0x8B63, WORD_LEN, 0},
+    {0x8890, 0xE809, WORD_LEN, 0},
+    {0x8892, 0xD509, WORD_LEN, 0},
+    {0x8894, 0xF004, WORD_LEN, 0},
+    {0x8896, 0x1504, WORD_LEN, 0},
+    {0x8898, 0x1400, WORD_LEN, 0},
+    {0x889A, 0x7840, WORD_LEN, 0},
+    {0x889C, 0xD007, WORD_LEN, 0},
+    {0x889E, 0x0DFB, WORD_LEN, 0},
+    {0x88A0, 0x9004, WORD_LEN, 0},
+    {0x88A2, 0xC4C1, WORD_LEN, 0},
+    {0x88A4, 0x2029, WORD_LEN, 0},
+    {0x88A6, 0x0300, WORD_LEN, 0},
+    {0x88A8, 0x021D, WORD_LEN, 0},
+    {0x88AA, 0x06C4, WORD_LEN, 0},
+    {0x88AC, 0xFF80, WORD_LEN, 0},
+    {0x88AE, 0x08C8, WORD_LEN, 0},
+    {0x88B0, 0xFF80, WORD_LEN, 0},
+    {0x88B2, 0x086C, WORD_LEN, 0},
+    {0x88B4, 0xFF80, WORD_LEN, 0},
+    {0x88B6, 0x08BC, WORD_LEN, 0},
+    {0x88B8, 0xFF80, WORD_LEN, 0},
+    {0x88BA, 0x08C8, WORD_LEN, 0},
+    {0x88BC, 0xFF80, WORD_LEN, 0},
+    {0x88BE, 0x08D0, WORD_LEN, 0},
+    {0x88C0, 0xFF80, WORD_LEN, 0},
+    {0x88C2, 0x0978, WORD_LEN, 0},
+    {0x88C4, 0xFF80, WORD_LEN, 0},
+    {0x88C6, 0x0F88, WORD_LEN, 0},
+    {0x88C8, 0x0007, WORD_LEN, 0},
+    {0x88CA, 0x0006, WORD_LEN, 0},
+    {0x88CC, 0x0000, WORD_LEN, 0},
+    {0x88CE, 0x0000, WORD_LEN, 0},
+    {0x88D0, 0xC0F1, WORD_LEN, 0},
+    {0x88D2, 0x097E, WORD_LEN, 0},
+    {0x88D4, 0x06E4, WORD_LEN, 0},
+    {0x88D6, 0xDA14, WORD_LEN, 0},
+    {0x88D8, 0xD0DB, WORD_LEN, 0},
+    {0x88DA, 0xDE00, WORD_LEN, 0},
+    {0x88DC, 0xD1DB, WORD_LEN, 0},
+    {0x88DE, 0x2E41, WORD_LEN, 0},
+    {0x88E0, 0x120C, WORD_LEN, 0},
+    {0x88E2, 0xA895, WORD_LEN, 0},
+    {0x88E4, 0xD5DA, WORD_LEN, 0},
+    {0x88E6, 0xA8D4, WORD_LEN, 0},
+    {0x88E8, 0xA8D6, WORD_LEN, 0},
+    {0x88EA, 0x0F0A, WORD_LEN, 0},
+    {0x88EC, 0x06A4, WORD_LEN, 0},
+    {0x88EE, 0x2555, WORD_LEN, 0},
+    {0x88F0, 0x1440, WORD_LEN, 0},
+    {0x88F2, 0xD0D8, WORD_LEN, 0},
+    {0x88F4, 0x2555, WORD_LEN, 0},
+    {0x88F6, 0x1441, WORD_LEN, 0},
+    {0x88F8, 0x77A9, WORD_LEN, 0},
+    {0x88FA, 0xA515, WORD_LEN, 0},
+    {0x88FC, 0xD0D6, WORD_LEN, 0},
+    {0x88FE, 0xA020, WORD_LEN, 0},
+    {0x8900, 0xD1D6, WORD_LEN, 0},
+    {0x8902, 0x70E9, WORD_LEN, 0},
+    {0x8904, 0x0EEE, WORD_LEN, 0},
+    {0x8906, 0x06A4, WORD_LEN, 0},
+    {0x8908, 0xDA44, WORD_LEN, 0},
+    {0x890A, 0xD0D5, WORD_LEN, 0},
+    {0x890C, 0xD1D5, WORD_LEN, 0},
+    {0x890E, 0xDAF0, WORD_LEN, 0},
+    {0x8910, 0xDB08, WORD_LEN, 0},
+    {0x8912, 0xA502, WORD_LEN, 0},
+    {0x8914, 0xD0D4, WORD_LEN, 0},
+    {0x8916, 0x19B0, WORD_LEN, 0},
+    {0x8918, 0x00C2, WORD_LEN, 0},
+    {0x891A, 0x19B1, WORD_LEN, 0},
+    {0x891C, 0x0082, WORD_LEN, 0},
+    {0x891E, 0x19B4, WORD_LEN, 0},
+    {0x8920, 0x00C2, WORD_LEN, 0},
+    {0x8922, 0xA0E0, WORD_LEN, 0},
+    {0x8924, 0xD0D1, WORD_LEN, 0},
+    {0x8926, 0x19B5, WORD_LEN, 0},
+    {0x8928, 0x0082, WORD_LEN, 0},
+    {0x892A, 0xB0CB, WORD_LEN, 0},
+    {0x892C, 0x8900, WORD_LEN, 0},
+    {0x892E, 0xB8A6, WORD_LEN, 0},
+    {0x8930, 0xA900, WORD_LEN, 0},
+    {0x8932, 0xD851, WORD_LEN, 0},
+    {0x8934, 0x19B2, WORD_LEN, 0},
+    {0x8936, 0x0002, WORD_LEN, 0},
+    {0x8938, 0xD852, WORD_LEN, 0},
+    {0x893A, 0x19B3, WORD_LEN, 0},
+    {0x893C, 0x0002, WORD_LEN, 0},
+    {0x893E, 0xD855, WORD_LEN, 0},
+    {0x8940, 0x19B6, WORD_LEN, 0},
+    {0x8942, 0x0002, WORD_LEN, 0},
+    {0x8944, 0xD856, WORD_LEN, 0},
+    {0x8946, 0x19B7, WORD_LEN, 0},
+    {0x8948, 0x0002, WORD_LEN, 0},
+    {0x894A, 0xD896, WORD_LEN, 0},
+    {0x894C, 0x19B8, WORD_LEN, 0},
+    {0x894E, 0x0004, WORD_LEN, 0},
+    {0x8950, 0xD814, WORD_LEN, 0},
+    {0x8952, 0x19BA, WORD_LEN, 0},
+    {0x8954, 0x0004, WORD_LEN, 0},
+    {0x8956, 0xD805, WORD_LEN, 0},
+    {0x8958, 0xB111, WORD_LEN, 0},
+    {0x895A, 0xD1C5, WORD_LEN, 0},
+    {0x895C, 0x2556, WORD_LEN, 0},
+    {0x895E, 0x12C0, WORD_LEN, 0},
+    {0x8960, 0x0E92, WORD_LEN, 0},
+    {0x8962, 0x06A4, WORD_LEN, 0},
+    {0x8964, 0xDA2C, WORD_LEN, 0},
+    {0x8966, 0xD0C3, WORD_LEN, 0},
+    {0x8968, 0x2556, WORD_LEN, 0},
+    {0x896A, 0x12C1, WORD_LEN, 0},
+    {0x896C, 0xA519, WORD_LEN, 0},
+    {0x896E, 0xD0C2, WORD_LEN, 0},
+    {0x8970, 0x0145, WORD_LEN, 0},
+    {0x8972, 0x06E4, WORD_LEN, 0},
+    {0x8974, 0xA020, WORD_LEN, 0},
+    {0x8976, 0x78E0, WORD_LEN, 0},
+    {0x8978, 0xD0C0, WORD_LEN, 0},
+    {0x897A, 0xD1B5, WORD_LEN, 0},
+    {0x897C, 0x1984, WORD_LEN, 0},
+    {0x897E, 0x0000, WORD_LEN, 0},
+    {0x8980, 0xD0BF, WORD_LEN, 0},
+    {0x8982, 0x1988, WORD_LEN, 0},
+    {0x8984, 0x0000, WORD_LEN, 0},
+    {0x8986, 0xD0BF, WORD_LEN, 0},
+    {0x8988, 0x198C, WORD_LEN, 0},
+    {0x898A, 0x0000, WORD_LEN, 0},
+    {0x898C, 0xD0BE, WORD_LEN, 0},
+    {0x898E, 0x1990, WORD_LEN, 0},
+    {0x8990, 0x0000, WORD_LEN, 0},
+    {0x8992, 0xD0BE, WORD_LEN, 0},
+    {0x8994, 0x2180, WORD_LEN, 0},
+    {0x8996, 0x0102, WORD_LEN, 0},
+    {0x8998, 0x7FE0, WORD_LEN, 0},
+    {0x899A, 0xA020, WORD_LEN, 0},
+    {0x899C, 0xC0F1, WORD_LEN, 0},
+    {0x899E, 0x08B6, WORD_LEN, 0},
+    {0x89A0, 0x06E4, WORD_LEN, 0},
+    {0x89A2, 0xDB03, WORD_LEN, 0},
+    {0x89A4, 0xD2BA, WORD_LEN, 0},
+    {0x89A6, 0x8A2E, WORD_LEN, 0},
+    {0x89A8, 0x8ACF, WORD_LEN, 0},
+    {0x89AA, 0xB908, WORD_LEN, 0},
+    {0x89AC, 0x79C5, WORD_LEN, 0},
+    {0x89AE, 0xDD65, WORD_LEN, 0},
+    {0x89B0, 0x094F, WORD_LEN, 0},
+    {0x89B2, 0x00D1, WORD_LEN, 0},
+    {0x89B4, 0xD90A, WORD_LEN, 0},
+    {0x89B6, 0x1A24, WORD_LEN, 0},
+    {0x89B8, 0x0042, WORD_LEN, 0},
+    {0x89BA, 0x8A24, WORD_LEN, 0},
+    {0x89BC, 0xE1E5, WORD_LEN, 0},
+    {0x89BE, 0xF6C9, WORD_LEN, 0},
+    {0x89C0, 0xD902, WORD_LEN, 0},
+    {0x89C2, 0x2941, WORD_LEN, 0},
+    {0x89C4, 0x0200, WORD_LEN, 0},
+    {0x89C6, 0xAA0E, WORD_LEN, 0},
+    {0x89C8, 0xAA2F, WORD_LEN, 0},
+    {0x89CA, 0x70A9, WORD_LEN, 0},
+    {0x89CC, 0xF014, WORD_LEN, 0},
+    {0x89CE, 0xE1C8, WORD_LEN, 0},
+    {0x89D0, 0x0036, WORD_LEN, 0},
+    {0x89D2, 0x000B, WORD_LEN, 0},
+    {0x89D4, 0xE0C8, WORD_LEN, 0},
+    {0x89D6, 0x003A, WORD_LEN, 0},
+    {0x89D8, 0x000A, WORD_LEN, 0},
+    {0x89DA, 0xD901, WORD_LEN, 0},
+    {0x89DC, 0x2941, WORD_LEN, 0},
+    {0x89DE, 0x0200, WORD_LEN, 0},
+    {0x89E0, 0xAA0E, WORD_LEN, 0},
+    {0x89E2, 0xAA2F, WORD_LEN, 0},
+    {0x89E4, 0xD848, WORD_LEN, 0},
+    {0x89E6, 0xF008, WORD_LEN, 0},
+    {0x89E8, 0xD900, WORD_LEN, 0},
+    {0x89EA, 0x2941, WORD_LEN, 0},
+    {0x89EC, 0x0200, WORD_LEN, 0},
+    {0x89EE, 0xAA0E, WORD_LEN, 0},
+    {0x89F0, 0xAA2F, WORD_LEN, 0},
+    {0x89F2, 0xD820, WORD_LEN, 0},
+    {0x89F4, 0xD2A7, WORD_LEN, 0},
+    {0x89F6, 0x8A26, WORD_LEN, 0},
+    {0x89F8, 0xB961, WORD_LEN, 0},
+    {0x89FA, 0xAA26, WORD_LEN, 0},
+    {0x89FC, 0xF00D, WORD_LEN, 0},
+    {0x89FE, 0x091F, WORD_LEN, 0},
+    {0x8A00, 0x0091, WORD_LEN, 0},
+    {0x8A02, 0x8A24, WORD_LEN, 0},
+    {0x8A04, 0xF1E5, WORD_LEN, 0},
+    {0x8A06, 0x0913, WORD_LEN, 0},
+    {0x8A08, 0x0812, WORD_LEN, 0},
+    {0x8A0A, 0x08E1, WORD_LEN, 0},
+    {0x8A0C, 0x8812, WORD_LEN, 0},
+    {0x8A0E, 0x2B41, WORD_LEN, 0},
+    {0x8A10, 0x0201, WORD_LEN, 0},
+    {0x8A12, 0xAA2E, WORD_LEN, 0},
+    {0x8A14, 0xAA6F, WORD_LEN, 0},
+    {0x8A16, 0x00A9, WORD_LEN, 0},
+    {0x8A18, 0x06C4, WORD_LEN, 0},
+    {0x8A1A, 0x09F7, WORD_LEN, 0},
+    {0x8A1C, 0x8051, WORD_LEN, 0},
+    {0x8A1E, 0x8A24, WORD_LEN, 0},
+    {0x8A20, 0xF1F3, WORD_LEN, 0},
+    {0x8A22, 0x78E0, WORD_LEN, 0},
+    {0x8A24, 0xC0F1, WORD_LEN, 0},
+    {0x8A26, 0x0822, WORD_LEN, 0},
+    {0x8A28, 0x06C4, WORD_LEN, 0},
+    {0x8A2A, 0xD699, WORD_LEN, 0},
+    {0x8A2C, 0x7508, WORD_LEN, 0},
+    {0x8A2E, 0xD199, WORD_LEN, 0},
+    {0x8A30, 0x8E01, WORD_LEN, 0},
+    {0x8A32, 0x1146, WORD_LEN, 0},
+    {0x8A34, 0x0082, WORD_LEN, 0},
+    {0x8A36, 0x2046, WORD_LEN, 0},
+    {0x8A38, 0x00C0, WORD_LEN, 0},
+    {0x8A3A, 0xAE01, WORD_LEN, 0},
+    {0x8A3C, 0x1145, WORD_LEN, 0},
+    {0x8A3E, 0x0080, WORD_LEN, 0},
+    {0x8A40, 0xB808, WORD_LEN, 0},
+    {0x8A42, 0x7845, WORD_LEN, 0},
+    {0x8A44, 0x0817, WORD_LEN, 0},
+    {0x8A46, 0x001E, WORD_LEN, 0},
+    {0x8A48, 0x8900, WORD_LEN, 0},
+    {0x8A4A, 0x8941, WORD_LEN, 0},
+    {0x8A4C, 0xB808, WORD_LEN, 0},
+    {0x8A4E, 0x7845, WORD_LEN, 0},
+    {0x8A50, 0x080B, WORD_LEN, 0},
+    {0x8A52, 0x00DE, WORD_LEN, 0},
+    {0x8A54, 0x70A9, WORD_LEN, 0},
+    {0x8A56, 0xFFD2, WORD_LEN, 0},
+    {0x8A58, 0x7508, WORD_LEN, 0},
+    {0x8A5A, 0x1604, WORD_LEN, 0},
+    {0x8A5C, 0x1090, WORD_LEN, 0},
+    {0x8A5E, 0x0D93, WORD_LEN, 0},
+    {0x8A60, 0x1400, WORD_LEN, 0},
+    {0x8A62, 0x8EEA, WORD_LEN, 0},
+    {0x8A64, 0x8E0B, WORD_LEN, 0},
+    {0x8A66, 0x214A, WORD_LEN, 0},
+    {0x8A68, 0x2040, WORD_LEN, 0},
+    {0x8A6A, 0x8E2D, WORD_LEN, 0},
+    {0x8A6C, 0xBF08, WORD_LEN, 0},
+    {0x8A6E, 0x7F05, WORD_LEN, 0},
+    {0x8A70, 0x8E0C, WORD_LEN, 0},
+    {0x8A72, 0xB808, WORD_LEN, 0},
+    {0x8A74, 0x7825, WORD_LEN, 0},
+    {0x8A76, 0x7710, WORD_LEN, 0},
+    {0x8A78, 0x21C2, WORD_LEN, 0},
+    {0x8A7A, 0x244C, WORD_LEN, 0},
+    {0x8A7C, 0x081D, WORD_LEN, 0},
+    {0x8A7E, 0x03E3, WORD_LEN, 0},
+    {0x8A80, 0xD9FF, WORD_LEN, 0},
+    {0x8A82, 0x2702, WORD_LEN, 0},
+    {0x8A84, 0x1002, WORD_LEN, 0},
+    {0x8A86, 0x2A05, WORD_LEN, 0},
+    {0x8A88, 0x037E, WORD_LEN, 0},
+    {0x8A8A, 0x089E, WORD_LEN, 0},
+    {0x8A8C, 0x06E4, WORD_LEN, 0},
+    {0x8A8E, 0x702F, WORD_LEN, 0},
+    {0x8A90, 0x7810, WORD_LEN, 0},
+    {0x8A92, 0x7F02, WORD_LEN, 0},
+    {0x8A94, 0x7FF0, WORD_LEN, 0},
+    {0x8A96, 0xF00B, WORD_LEN, 0},
+    {0x8A98, 0x78E2, WORD_LEN, 0},
+    {0x8A9A, 0x2805, WORD_LEN, 0},
+    {0x8A9C, 0x037E, WORD_LEN, 0},
+    {0x8A9E, 0x088A, WORD_LEN, 0},
+    {0x8AA0, 0x06E4, WORD_LEN, 0},
+    {0x8AA2, 0x702F, WORD_LEN, 0},
+    {0x8AA4, 0x7810, WORD_LEN, 0},
+    {0x8AA6, 0x671F, WORD_LEN, 0},
+    {0x8AA8, 0x7FF0, WORD_LEN, 0},
+    {0x8AAA, 0x8E08, WORD_LEN, 0},
+    {0x8AAC, 0xD17A, WORD_LEN, 0},
+    {0x8AAE, 0x7FEF, WORD_LEN, 0},
+    {0x8AB0, 0xBF06, WORD_LEN, 0},
+    {0x8AB2, 0xB8C3, WORD_LEN, 0},
+    {0x8AB4, 0x78E5, WORD_LEN, 0},
+    {0x8AB6, 0xB88F, WORD_LEN, 0},
+    {0x8AB8, 0x1908, WORD_LEN, 0},
+    {0x8ABA, 0x0024, WORD_LEN, 0},
+    {0x8ABC, 0x2841, WORD_LEN, 0},
+    {0x8ABE, 0x0201, WORD_LEN, 0},
+    {0x8AC0, 0x1E26, WORD_LEN, 0},
+    {0x8AC2, 0x1042, WORD_LEN, 0},
+    {0x8AC4, 0x0D15, WORD_LEN, 0},
+    {0x8AC6, 0x1423, WORD_LEN, 0},
+    {0x8AC8, 0x1E27, WORD_LEN, 0},
+    {0x8ACA, 0x1002, WORD_LEN, 0},
+    {0x8ACC, 0x214C, WORD_LEN, 0},
+    {0x8ACE, 0xA000, WORD_LEN, 0},
+    {0x8AD0, 0x214A, WORD_LEN, 0},
+    {0x8AD2, 0x2040, WORD_LEN, 0},
+    {0x8AD4, 0x21C2, WORD_LEN, 0},
+    {0x8AD6, 0x2442, WORD_LEN, 0},
+    {0x8AD8, 0x8E21, WORD_LEN, 0},
+    {0x8ADA, 0x214F, WORD_LEN, 0},
+    {0x8ADC, 0x0040, WORD_LEN, 0},
+    {0x8ADE, 0x090F, WORD_LEN, 0},
+    {0x8AE0, 0x2010, WORD_LEN, 0},
+    {0x8AE2, 0x2145, WORD_LEN, 0},
+    {0x8AE4, 0x0181, WORD_LEN, 0},
+    {0x8AE6, 0xAE21, WORD_LEN, 0},
+    {0x8AE8, 0xF003, WORD_LEN, 0},
+    {0x8AEA, 0xB8A2, WORD_LEN, 0},
+    {0x8AEC, 0xAE01, WORD_LEN, 0},
+    {0x8AEE, 0x0C22, WORD_LEN, 0},
+    {0x8AF0, 0xFFE3, WORD_LEN, 0},
+    {0x8AF2, 0x70A9, WORD_LEN, 0},
+    {0x8AF4, 0x07B1, WORD_LEN, 0},
+    {0x8AF6, 0x0684, WORD_LEN, 0},
+    {0x8AF8, 0xC0F1, WORD_LEN, 0},
+    {0x8AFA, 0x0F5A, WORD_LEN, 0},
+    {0x8AFC, 0x0684, WORD_LEN, 0},
+    {0x8AFE, 0xD564, WORD_LEN, 0},
+    {0x8B00, 0x8D00, WORD_LEN, 0},
+    {0x8B02, 0x083D, WORD_LEN, 0},
+    {0x8B04, 0x01DE, WORD_LEN, 0},
+    {0x8B06, 0xB8A7, WORD_LEN, 0},
+    {0x8B08, 0x790F, WORD_LEN, 0},
+    {0x8B0A, 0xD660, WORD_LEN, 0},
+    {0x8B0C, 0xAD00, WORD_LEN, 0},
+    {0x8B0E, 0x091D, WORD_LEN, 0},
+    {0x8B10, 0x0050, WORD_LEN, 0},
+    {0x8B12, 0x091D, WORD_LEN, 0},
+    {0x8B14, 0x0110, WORD_LEN, 0},
+    {0x8B16, 0x0911, WORD_LEN, 0},
+    {0x8B18, 0x0210, WORD_LEN, 0},
+    {0x8B1A, 0xD060, WORD_LEN, 0},
+    {0x8B1C, 0x0B56, WORD_LEN, 0},
+    {0x8B1E, 0xFFE3, WORD_LEN, 0},
+    {0x8B20, 0xA600, WORD_LEN, 0},
+    {0x8B22, 0xF008, WORD_LEN, 0},
+    {0x8B24, 0xD05E, WORD_LEN, 0},
+    {0x8B26, 0xF005, WORD_LEN, 0},
+    {0x8B28, 0xD05E, WORD_LEN, 0},
+    {0x8B2A, 0xF003, WORD_LEN, 0},
+    {0x8B2C, 0xD05E, WORD_LEN, 0},
+    {0x8B2E, 0xA600, WORD_LEN, 0},
+    {0x8B30, 0x8600, WORD_LEN, 0},
+    {0x8B32, 0x8023, WORD_LEN, 0},
+    {0x8B34, 0x7960, WORD_LEN, 0},
+    {0x8B36, 0xD801, WORD_LEN, 0},
+    {0x8B38, 0xD800, WORD_LEN, 0},
+    {0x8B3A, 0xAD05, WORD_LEN, 0},
+    {0x8B3C, 0x1528, WORD_LEN, 0},
+    {0x8B3E, 0x1080, WORD_LEN, 0},
+    {0x8B40, 0x0817, WORD_LEN, 0},
+    {0x8B42, 0x01DE, WORD_LEN, 0},
+    {0x8B44, 0xB8A7, WORD_LEN, 0},
+    {0x8B46, 0x1D28, WORD_LEN, 0},
+    {0x8B48, 0x1002, WORD_LEN, 0},
+    {0x8B4A, 0xD050, WORD_LEN, 0},
+    {0x8B4C, 0x8000, WORD_LEN, 0},
+    {0x8B4E, 0x8023, WORD_LEN, 0},
+    {0x8B50, 0x7960, WORD_LEN, 0},
+    {0x8B52, 0x1528, WORD_LEN, 0},
+    {0x8B54, 0x1080, WORD_LEN, 0},
+    {0x8B56, 0x0769, WORD_LEN, 0},
+    {0x8B58, 0x0684, WORD_LEN, 0},
+    {0x8B5A, 0x78E0, WORD_LEN, 0},
+    {0x8B5C, 0xD24C, WORD_LEN, 0},
+    {0x8B5E, 0x8A21, WORD_LEN, 0},
+    {0x8B60, 0xB9A1, WORD_LEN, 0},
+    {0x8B62, 0x782F, WORD_LEN, 0},
+    {0x8B64, 0x7FE0, WORD_LEN, 0},
+    {0x8B66, 0xAA21, WORD_LEN, 0},
+    {0x8B68, 0xD150, WORD_LEN, 0},
+    {0x8B6A, 0xD251, WORD_LEN, 0},
+    {0x8B6C, 0x11B2, WORD_LEN, 0},
+    {0x8B6E, 0x8903, WORD_LEN, 0},
+    {0x8B70, 0x1252, WORD_LEN, 0},
+    {0x8B72, 0x0100, WORD_LEN, 0},
+    {0x8B74, 0x7B6F, WORD_LEN, 0},
+    {0x8B76, 0xB808, WORD_LEN, 0},
+    {0x8B78, 0x2004, WORD_LEN, 0},
+    {0x8B7A, 0x0F80, WORD_LEN, 0},
+    {0x8B7C, 0x0000, WORD_LEN, 0},
+    {0x8B7E, 0xFF00, WORD_LEN, 0},
+    {0x8B80, 0x7865, WORD_LEN, 0},
+    {0x8B82, 0x19B2, WORD_LEN, 0},
+    {0x8B84, 0x8024, WORD_LEN, 0},
+    {0x8B86, 0xD04B, WORD_LEN, 0},
+    {0x8B88, 0x8801, WORD_LEN, 0},
+    {0x8B8A, 0x2051, WORD_LEN, 0},
+    {0x8B8C, 0x8040, WORD_LEN, 0},
+    {0x8B8E, 0xD800, WORD_LEN, 0},
+    {0x8B90, 0xF403, WORD_LEN, 0},
+    {0x8B92, 0x1234, WORD_LEN, 0},
+    {0x8B94, 0x0080, WORD_LEN, 0},
+    {0x8B96, 0x1955, WORD_LEN, 0},
+    {0x8B98, 0x803C, WORD_LEN, 0},
+    {0x8B9A, 0x1233, WORD_LEN, 0},
+    {0x8B9C, 0x0080, WORD_LEN, 0},
+    {0x8B9E, 0xB802, WORD_LEN, 0},
+    {0x8BA0, 0x1957, WORD_LEN, 0},
+    {0x8BA2, 0x803C, WORD_LEN, 0},
+    {0x8BA4, 0x1958, WORD_LEN, 0},
+    {0x8BA6, 0x803C, WORD_LEN, 0},
+    {0x8BA8, 0x1959, WORD_LEN, 0},
+    {0x8BAA, 0x803C, WORD_LEN, 0},
+    {0x8BAC, 0x195A, WORD_LEN, 0},
+    {0x8BAE, 0x803C, WORD_LEN, 0},
+    {0x8BB0, 0x7EE0, WORD_LEN, 0},
+    {0x8BB2, 0x78E0, WORD_LEN, 0},
+    {0x8BB4, 0xC0F1, WORD_LEN, 0},
+    {0x8BB6, 0x0E9A, WORD_LEN, 0},
+    {0x8BB8, 0x0684, WORD_LEN, 0},
+    {0x8BBA, 0xD523, WORD_LEN, 0},
+    {0x8BBC, 0x8D2C, WORD_LEN, 0},
+    {0x8BBE, 0x0983, WORD_LEN, 0},
+    {0x8BC0, 0x0010, WORD_LEN, 0},
+    {0x8BC2, 0xD23C, WORD_LEN, 0},
+    {0x8BC4, 0x123A, WORD_LEN, 0},
+    {0x8BC6, 0x0083, WORD_LEN, 0},
+    {0x8BC8, 0x123B, WORD_LEN, 0},
+    {0x8BCA, 0x008F, WORD_LEN, 0},
+    {0x8BCC, 0x8D55, WORD_LEN, 0},
+    {0x8BCE, 0xBB08, WORD_LEN, 0},
+    {0x8BD0, 0x7BE5, WORD_LEN, 0},
+    {0x8BD2, 0x8DF6, WORD_LEN, 0},
+    {0x8BD4, 0xBA08, WORD_LEN, 0},
+    {0x8BD6, 0x7AE5, WORD_LEN, 0},
+    {0x8BD8, 0x0B0D, WORD_LEN, 0},
+    {0x8BDA, 0x00A3, WORD_LEN, 0},
+    {0x8BDC, 0x8DC5, WORD_LEN, 0},
+    {0x8BDE, 0x8D54, WORD_LEN, 0},
+    {0x8BE0, 0xAD45, WORD_LEN, 0},
+    {0x8BE2, 0xF026, WORD_LEN, 0},
+    {0x8BE4, 0x65DB, WORD_LEN, 0},
+    {0x8BE6, 0x8B6D, WORD_LEN, 0},
+    {0x8BE8, 0x0815, WORD_LEN, 0},
+    {0x8BEA, 0x00E2, WORD_LEN, 0},
+    {0x8BEC, 0x65DA, WORD_LEN, 0},
+    {0x8BEE, 0x8A51, WORD_LEN, 0},
+    {0x8BF0, 0x0A0D, WORD_LEN, 0},
+    {0x8BF2, 0x0002, WORD_LEN, 0},
+    {0x8BF4, 0xE683, WORD_LEN, 0},
+    {0x8BF6, 0x22CA, WORD_LEN, 0},
+    {0x8BF8, 0x038B, WORD_LEN, 0},
+    {0x8BFA, 0xF69A, WORD_LEN, 0},
+    {0x8BFC, 0xDA00, WORD_LEN, 0},
+    {0x8BFE, 0xAD45, WORD_LEN, 0},
+    {0x8C00, 0x2540, WORD_LEN, 0},
+    {0x8C02, 0x1343, WORD_LEN, 0},
+    {0x8C04, 0xE180, WORD_LEN, 0},
+    {0x8C06, 0x2540, WORD_LEN, 0},
+    {0x8C08, 0x144F, WORD_LEN, 0},
+    {0x8C0A, 0xF6D2, WORD_LEN, 0},
+    {0x8C0C, 0x719F, WORD_LEN, 0},
+    {0x8C0E, 0x78E0, WORD_LEN, 0},
+    {0x8C10, 0x20A8, WORD_LEN, 0},
+    {0x8C12, 0x0280, WORD_LEN, 0},
+    {0x8C14, 0x8B20, WORD_LEN, 0},
+    {0x8C16, 0x0813, WORD_LEN, 0},
+    {0x8C18, 0x0043, WORD_LEN, 0},
+    {0x8C1A, 0xE201, WORD_LEN, 0},
+    {0x8C1C, 0x7A4F, WORD_LEN, 0},
+    {0x8C1E, 0xAD45, WORD_LEN, 0},
+    {0x8C20, 0xE301, WORD_LEN, 0},
+    {0x8C22, 0xE701, WORD_LEN, 0},
+    {0x8C24, 0xF004, WORD_LEN, 0},
+    {0x8C26, 0x8F20, WORD_LEN, 0},
+    {0x8C28, 0x09F3, WORD_LEN, 0},
+    {0x8C2A, 0x8002, WORD_LEN, 0},
+    {0x8C2C, 0xD022, WORD_LEN, 0},
+    {0x8C2E, 0x8800, WORD_LEN, 0},
+    {0x8C30, 0xE803, WORD_LEN, 0},
+    {0x8C32, 0x0E0F, WORD_LEN, 0},
+    {0x8C34, 0x1080, WORD_LEN, 0},
+    {0x8C36, 0xD008, WORD_LEN, 0},
+    {0x8C38, 0x8000, WORD_LEN, 0},
+    {0x8C3A, 0x8002, WORD_LEN, 0},
+    {0x8C3C, 0x7840, WORD_LEN, 0},
+    {0x8C3E, 0x0679, WORD_LEN, 0},
+    {0x8C40, 0x0684, WORD_LEN, 0},
+    {0x8C42, 0x78E0, WORD_LEN, 0},
+    {0x8C44, 0xFF80, WORD_LEN, 0},
+    {0x8C46, 0x0644, WORD_LEN, 0},
+    {0x8C48, 0x0000, WORD_LEN, 0},
+    {0x8C4A, 0xF978, WORD_LEN, 0},
+    {0x8C4C, 0xFF80, WORD_LEN, 0},
+    {0x8C4E, 0x1030, WORD_LEN, 0},
+    {0x8C50, 0xFF80, WORD_LEN, 0},
+    {0x8C52, 0x0BB4, WORD_LEN, 0},
+    {0x8C54, 0x8000, WORD_LEN, 0},
+    {0x8C56, 0x0164, WORD_LEN, 0},
+    {0x8C58, 0x0000, WORD_LEN, 0},
+    {0x8C5A, 0xF9AC, WORD_LEN, 0},
+    {0x8C5C, 0xFF80, WORD_LEN, 0},
+    {0x8C5E, 0x0B68, WORD_LEN, 0},
+    {0x8C60, 0xFF80, WORD_LEN, 0},
+    {0x8C62, 0x0314, WORD_LEN, 0},
+    {0x8C64, 0x8000, WORD_LEN, 0},
+    {0x8C66, 0x016C, WORD_LEN, 0},
+    {0x8C68, 0xFF80, WORD_LEN, 0},
+    {0x8C6A, 0x0694, WORD_LEN, 0},
+    {0x8C6C, 0x0000, WORD_LEN, 0},
+    {0x8C6E, 0xF444, WORD_LEN, 0},
+    {0x8C70, 0xFF80, WORD_LEN, 0},
+    {0x8C72, 0x0CB8, WORD_LEN, 0},
+    {0x8C74, 0x8000, WORD_LEN, 0},
+    {0x8C76, 0x009C, WORD_LEN, 0},
+    {0x8C78, 0xFF80, WORD_LEN, 0},
+    {0x8C7A, 0x0AF8, WORD_LEN, 0},
+    {0x8C7C, 0xFF80, WORD_LEN, 0},
+    {0x8C7E, 0x0A24, WORD_LEN, 0},
+    {0x8C80, 0xFF80, WORD_LEN, 0},
+    {0x8C82, 0x0B5C, WORD_LEN, 0},
+    {0x8C84, 0x0000, WORD_LEN, 0},
+    {0x8C86, 0x0998, WORD_LEN, 0},
+    {0x8C88, 0x8000, WORD_LEN, 0},
+    {0x8C8A, 0x0008, WORD_LEN, 0},
+    {0x8C8C, 0xFF80, WORD_LEN, 0},
+    {0x8C8E, 0x0158, WORD_LEN, 0},
+    {0x8C90, 0xFF80, WORD_LEN, 0},
+    {0x8C92, 0x0290, WORD_LEN, 0},
+    {0x8C94, 0xFF00, WORD_LEN, 0},
+    {0x8C96, 0x0618, WORD_LEN, 0},
+    {0x8C98, 0x0000, WORD_LEN, 0},
+    {0x8C9A, 0xF1A4, WORD_LEN, 0},
+    {0x8C9C, 0xFF80, WORD_LEN, 0},
+    {0x8C9E, 0x10B4, WORD_LEN, 0},
+    {0x8CA0, 0x0000, WORD_LEN, 0},
+    {0x8CA2, 0xF1B4, WORD_LEN, 0},
+    {0x8CA4, 0x0000, WORD_LEN, 0},
+    {0x8CA6, 0xF1C4, WORD_LEN, 0},
+    {0x8CA8, 0xFF00, WORD_LEN, 0},
+    {0x8CAA, 0x33CC, WORD_LEN, 0},
+    {0x8CAC, 0xFF80, WORD_LEN, 0},
+    {0x8CAE, 0x0658, WORD_LEN, 0},
+    {0x8CB0, 0xFF80, WORD_LEN, 0},
+    {0x8CB2, 0x0250, WORD_LEN, 0},
+    {0x8CB4, 0x8000, WORD_LEN, 0},
+    {0x8CB6, 0x0168, WORD_LEN, 0},
+    {0x8CB8, 0xC0F1, WORD_LEN, 0},
+    {0x8CBA, 0x0D9A, WORD_LEN, 0},
+    {0x8CBC, 0x0684, WORD_LEN, 0},
+    {0x8CBE, 0x17A4, WORD_LEN, 0},
+    {0x8CC0, 0xF00E, WORD_LEN, 0},
+    {0x8CC2, 0x8E01, WORD_LEN, 0},
+    {0x8CC4, 0xB8A4, WORD_LEN, 0},
+    {0x8CC6, 0xAE01, WORD_LEN, 0},
+    {0x8CC8, 0x8E09, WORD_LEN, 0},
+    {0x8CCA, 0x2051, WORD_LEN, 0},
+    {0x8CCC, 0x8000, WORD_LEN, 0},
+    {0x8CCE, 0xF29C, WORD_LEN, 0},
+    {0x8CD0, 0x17E0, WORD_LEN, 0},
+    {0x8CD2, 0xF00D, WORD_LEN, 0},
+    {0x8CD4, 0x153A, WORD_LEN, 0},
+    {0x8CD6, 0x1080, WORD_LEN, 0},
+    {0x8CD8, 0x153B, WORD_LEN, 0},
+    {0x8CDA, 0x1081, WORD_LEN, 0},
+    {0x8CDC, 0xB808, WORD_LEN, 0},
+    {0x8CDE, 0x7825, WORD_LEN, 0},
+    {0x8CE0, 0x16B8, WORD_LEN, 0},
+    {0x8CE2, 0x1101, WORD_LEN, 0},
+    {0x8CE4, 0x092B, WORD_LEN, 0},
+    {0x8CE6, 0x0003, WORD_LEN, 0},
+    {0x8CE8, 0x16B0, WORD_LEN, 0},
+    {0x8CEA, 0x1082, WORD_LEN, 0},
+    {0x8CEC, 0x1E3C, WORD_LEN, 0},
+    {0x8CEE, 0x1082, WORD_LEN, 0},
+    {0x8CF0, 0x16B1, WORD_LEN, 0},
+    {0x8CF2, 0x1082, WORD_LEN, 0},
+    {0x8CF4, 0x1E3D, WORD_LEN, 0},
+    {0x8CF6, 0x1082, WORD_LEN, 0},
+    {0x8CF8, 0x16B4, WORD_LEN, 0},
+    {0x8CFA, 0x1082, WORD_LEN, 0},
+    {0x8CFC, 0x1E3E, WORD_LEN, 0},
+    {0x8CFE, 0x1082, WORD_LEN, 0},
+    {0x8D00, 0x16B5, WORD_LEN, 0},
+    {0x8D02, 0x1082, WORD_LEN, 0},
+    {0x8D04, 0x1E3F, WORD_LEN, 0},
+    {0x8D06, 0x1082, WORD_LEN, 0},
+    {0x8D08, 0x8E40, WORD_LEN, 0},
+    {0x8D0A, 0xBAA6, WORD_LEN, 0},
+    {0x8D0C, 0xAE40, WORD_LEN, 0},
+    {0x8D0E, 0x0991, WORD_LEN, 0},
+    {0x8D10, 0x0022, WORD_LEN, 0},
+    {0x8D12, 0x16BA, WORD_LEN, 0},
+    {0x8D14, 0x1102, WORD_LEN, 0},
+    {0x8D16, 0x0A89, WORD_LEN, 0},
+    {0x8D18, 0x0003, WORD_LEN, 0},
+    {0x8D1A, 0x16B2, WORD_LEN, 0},
+    {0x8D1C, 0x1084, WORD_LEN, 0},
+    {0x8D1E, 0x0ECA, WORD_LEN, 0},
+    {0x8D20, 0x0664, WORD_LEN, 0},
+    {0x8D22, 0x16B0, WORD_LEN, 0},
+    {0x8D24, 0x1083, WORD_LEN, 0},
+    {0x8D26, 0x1E3C, WORD_LEN, 0},
+    {0x8D28, 0x1002, WORD_LEN, 0},
+    {0x8D2A, 0x153A, WORD_LEN, 0},
+    {0x8D2C, 0x1080, WORD_LEN, 0},
+    {0x8D2E, 0x153B, WORD_LEN, 0},
+    {0x8D30, 0x1081, WORD_LEN, 0},
+    {0x8D32, 0x16B3, WORD_LEN, 0},
+    {0x8D34, 0x1084, WORD_LEN, 0},
+    {0x8D36, 0xB808, WORD_LEN, 0},
+    {0x8D38, 0x7825, WORD_LEN, 0},
+    {0x8D3A, 0x16B8, WORD_LEN, 0},
+    {0x8D3C, 0x1101, WORD_LEN, 0},
+    {0x8D3E, 0x16BA, WORD_LEN, 0},
+    {0x8D40, 0x1102, WORD_LEN, 0},
+    {0x8D42, 0x0EA6, WORD_LEN, 0},
+    {0x8D44, 0x0664, WORD_LEN, 0},
+    {0x8D46, 0x16B1, WORD_LEN, 0},
+    {0x8D48, 0x1083, WORD_LEN, 0},
+    {0x8D4A, 0x1E3D, WORD_LEN, 0},
+    {0x8D4C, 0x1002, WORD_LEN, 0},
+    {0x8D4E, 0x153A, WORD_LEN, 0},
+    {0x8D50, 0x1080, WORD_LEN, 0},
+    {0x8D52, 0x153B, WORD_LEN, 0},
+    {0x8D54, 0x1081, WORD_LEN, 0},
+    {0x8D56, 0x16B6, WORD_LEN, 0},
+    {0x8D58, 0x1084, WORD_LEN, 0},
+    {0x8D5A, 0xB808, WORD_LEN, 0},
+    {0x8D5C, 0x7825, WORD_LEN, 0},
+    {0x8D5E, 0x16B8, WORD_LEN, 0},
+    {0x8D60, 0x1101, WORD_LEN, 0},
+    {0x8D62, 0x16BA, WORD_LEN, 0},
+    {0x8D64, 0x1102, WORD_LEN, 0},
+    {0x8D66, 0x0E82, WORD_LEN, 0},
+    {0x8D68, 0x0664, WORD_LEN, 0},
+    {0x8D6A, 0x16B4, WORD_LEN, 0},
+    {0x8D6C, 0x1083, WORD_LEN, 0},
+    {0x8D6E, 0x1E3E, WORD_LEN, 0},
+    {0x8D70, 0x1002, WORD_LEN, 0},
+    {0x8D72, 0x153A, WORD_LEN, 0},
+    {0x8D74, 0x1080, WORD_LEN, 0},
+    {0x8D76, 0x153B, WORD_LEN, 0},
+    {0x8D78, 0x1081, WORD_LEN, 0},
+    {0x8D7A, 0x16B7, WORD_LEN, 0},
+    {0x8D7C, 0x1084, WORD_LEN, 0},
+    {0x8D7E, 0xB808, WORD_LEN, 0},
+    {0x8D80, 0x7825, WORD_LEN, 0},
+    {0x8D82, 0x16B8, WORD_LEN, 0},
+    {0x8D84, 0x1101, WORD_LEN, 0},
+    {0x8D86, 0x16BA, WORD_LEN, 0},
+    {0x8D88, 0x1102, WORD_LEN, 0},
+    {0x8D8A, 0x0E5E, WORD_LEN, 0},
+    {0x8D8C, 0x0664, WORD_LEN, 0},
+    {0x8D8E, 0x16B5, WORD_LEN, 0},
+    {0x8D90, 0x1083, WORD_LEN, 0},
+    {0x8D92, 0x1E3F, WORD_LEN, 0},
+    {0x8D94, 0x1002, WORD_LEN, 0},
+    {0x8D96, 0x8E00, WORD_LEN, 0},
+    {0x8D98, 0xB8A6, WORD_LEN, 0},
+    {0x8D9A, 0xAE00, WORD_LEN, 0},
+    {0x8D9C, 0x153A, WORD_LEN, 0},
+    {0x8D9E, 0x1081, WORD_LEN, 0},
+    {0x8DA0, 0x153B, WORD_LEN, 0},
+    {0x8DA2, 0x1080, WORD_LEN, 0},
+    {0x8DA4, 0xB908, WORD_LEN, 0},
+    {0x8DA6, 0x7905, WORD_LEN, 0},
+    {0x8DA8, 0x16BA, WORD_LEN, 0},
+    {0x8DAA, 0x1100, WORD_LEN, 0},
+    {0x8DAC, 0x0859, WORD_LEN, 0},
+    {0x8DAE, 0x0042, WORD_LEN, 0},
+    {0x8DB0, 0xD017, WORD_LEN, 0},
+    {0x8DB2, 0x9E31, WORD_LEN, 0},
+    {0x8DB4, 0x904D, WORD_LEN, 0},
+    {0x8DB6, 0x0A2D, WORD_LEN, 0},
+    {0x8DB8, 0x0063, WORD_LEN, 0},
+    {0x8DBA, 0x8E00, WORD_LEN, 0},
+    {0x8DBC, 0x16B0, WORD_LEN, 0},
+    {0x8DBE, 0x1081, WORD_LEN, 0},
+    {0x8DC0, 0x1E3C, WORD_LEN, 0},
+    {0x8DC2, 0x1042, WORD_LEN, 0},
+    {0x8DC4, 0x16B1, WORD_LEN, 0},
+    {0x8DC6, 0x1081, WORD_LEN, 0},
+    {0x8DC8, 0x1E3D, WORD_LEN, 0},
+    {0x8DCA, 0x1042, WORD_LEN, 0},
+    {0x8DCC, 0x16B4, WORD_LEN, 0},
+    {0x8DCE, 0x1081, WORD_LEN, 0},
+    {0x8DD0, 0x1E3E, WORD_LEN, 0},
+    {0x8DD2, 0x1042, WORD_LEN, 0},
+    {0x8DD4, 0x16B5, WORD_LEN, 0},
+    {0x8DD6, 0x1081, WORD_LEN, 0},
+    {0x8DD8, 0x1E3F, WORD_LEN, 0},
+    {0x8DDA, 0x1042, WORD_LEN, 0},
+    {0x8DDC, 0xB886, WORD_LEN, 0},
+    {0x8DDE, 0xF013, WORD_LEN, 0},
+    {0x8DE0, 0x16B2, WORD_LEN, 0},
+    {0x8DE2, 0x1081, WORD_LEN, 0},
+    {0x8DE4, 0xB8A6, WORD_LEN, 0},
+    {0x8DE6, 0x1E3C, WORD_LEN, 0},
+    {0x8DE8, 0x1042, WORD_LEN, 0},
+    {0x8DEA, 0x16B3, WORD_LEN, 0},
+    {0x8DEC, 0x1081, WORD_LEN, 0},
+    {0x8DEE, 0x1E3D, WORD_LEN, 0},
+    {0x8DF0, 0x1042, WORD_LEN, 0},
+    {0x8DF2, 0x16B6, WORD_LEN, 0},
+    {0x8DF4, 0x1081, WORD_LEN, 0},
+    {0x8DF6, 0x1E3E, WORD_LEN, 0},
+    {0x8DF8, 0x1042, WORD_LEN, 0},
+    {0x8DFA, 0x16B7, WORD_LEN, 0},
+    {0x8DFC, 0x1081, WORD_LEN, 0},
+    {0x8DFE, 0x1E3F, WORD_LEN, 0},
+    {0x8E00, 0x1042, WORD_LEN, 0},
+    {0x8E02, 0xAE00, WORD_LEN, 0},
+    {0x8E04, 0x0D2A, WORD_LEN, 0},
+    {0x8E06, 0x0184, WORD_LEN, 0},
+    {0x8E08, 0x04B5, WORD_LEN, 0},
+    {0x8E0A, 0x0684, WORD_LEN, 0},
+    {0x8E0C, 0xFF80, WORD_LEN, 0},
+    {0x8E0E, 0x050C, WORD_LEN, 0},
+    {0x8E10, 0xC0F1, WORD_LEN, 0},
+    {0x8E12, 0x0BAA, WORD_LEN, 0},
+    {0x8E14, 0x0224, WORD_LEN, 0},
+    {0x8E16, 0xC5E1, WORD_LEN, 0},
+    {0x8E18, 0xD067, WORD_LEN, 0},
+    {0x8E1A, 0x8000, WORD_LEN, 0},
+    {0x8E1C, 0x880A, WORD_LEN, 0},
+    {0x8E1E, 0x085B, WORD_LEN, 0},
+    {0x8E20, 0x019F, WORD_LEN, 0},
+    {0x8E22, 0xD166, WORD_LEN, 0},
+    {0x8E24, 0xD800, WORD_LEN, 0},
+    {0x8E26, 0xA90F, WORD_LEN, 0},
+    {0x8E28, 0xD165, WORD_LEN, 0},
+    {0x8E2A, 0x81A1, WORD_LEN, 0},
+    {0x8E2C, 0x8160, WORD_LEN, 0},
+    {0x8E2E, 0xD165, WORD_LEN, 0},
+    {0x8E30, 0x2D41, WORD_LEN, 0},
+    {0x8E32, 0x1602, WORD_LEN, 0},
+    {0x8E34, 0x2B41, WORD_LEN, 0},
+    {0x8E36, 0x060C, WORD_LEN, 0},
+    {0x8E38, 0x1934, WORD_LEN, 0},
+    {0x8E3A, 0x0082, WORD_LEN, 0},
+    {0x8E3C, 0x1930, WORD_LEN, 0},
+    {0x8E3E, 0x0302, WORD_LEN, 0},
+    {0x8E40, 0x2D41, WORD_LEN, 0},
+    {0x8E42, 0x1402, WORD_LEN, 0},
+    {0x8E44, 0x2B41, WORD_LEN, 0},
+    {0x8E46, 0x040C, WORD_LEN, 0},
+    {0x8E48, 0x1935, WORD_LEN, 0},
+    {0x8E4A, 0x0082, WORD_LEN, 0},
+    {0x8E4C, 0x1931, WORD_LEN, 0},
+    {0x8E4E, 0x0302, WORD_LEN, 0},
+    {0x8E50, 0x2D41, WORD_LEN, 0},
+    {0x8E52, 0x1202, WORD_LEN, 0},
+    {0x8E54, 0x2B41, WORD_LEN, 0},
+    {0x8E56, 0x020C, WORD_LEN, 0},
+    {0x8E58, 0x1936, WORD_LEN, 0},
+    {0x8E5A, 0x0082, WORD_LEN, 0},
+    {0x8E5C, 0x1932, WORD_LEN, 0},
+    {0x8E5E, 0x0302, WORD_LEN, 0},
+    {0x8E60, 0x1937, WORD_LEN, 0},
+    {0x8E62, 0x0342, WORD_LEN, 0},
+    {0x8E64, 0x1933, WORD_LEN, 0},
+    {0x8E66, 0x00C2, WORD_LEN, 0},
+    {0x8E68, 0xD157, WORD_LEN, 0},
+    {0x8E6A, 0x8120, WORD_LEN, 0},
+    {0x8E6C, 0x7208, WORD_LEN, 0},
+    {0x8E6E, 0x81A8, WORD_LEN, 0},
+    {0x8E70, 0x7108, WORD_LEN, 0},
+    {0x8E72, 0x7D60, WORD_LEN, 0},
+    {0x8E74, 0x7308, WORD_LEN, 0},
+    {0x8E76, 0x0451, WORD_LEN, 0},
+    {0x8E78, 0x0684, WORD_LEN, 0},
+    {0x8E7A, 0x78E0, WORD_LEN, 0},
+    {0x8E7C, 0xC0F1, WORD_LEN, 0},
+    {0x8E7E, 0x0AE2, WORD_LEN, 0},
+    {0x8E80, 0x0224, WORD_LEN, 0},
+    {0x8E82, 0xC5E1, WORD_LEN, 0},
+    {0x8E84, 0xD14D, WORD_LEN, 0},
+    {0x8E86, 0x894D, WORD_LEN, 0},
+    {0x8E88, 0x0A63, WORD_LEN, 0},
+    {0x8E8A, 0x0002, WORD_LEN, 0},
+    {0x8E8C, 0xD04A, WORD_LEN, 0},
+    {0x8E8E, 0x8040, WORD_LEN, 0},
+    {0x8E90, 0x8A0B, WORD_LEN, 0},
+    {0x8E92, 0xB8A6, WORD_LEN, 0},
+    {0x8E94, 0xAA0B, WORD_LEN, 0},
+    {0x8E96, 0xD800, WORD_LEN, 0},
+    {0x8E98, 0xA90F, WORD_LEN, 0},
+    {0x8E9A, 0xD149, WORD_LEN, 0},
+    {0x8E9C, 0x8161, WORD_LEN, 0},
+    {0x8E9E, 0x81A0, WORD_LEN, 0},
+    {0x8EA0, 0xD148, WORD_LEN, 0},
+    {0x8EA2, 0x2B41, WORD_LEN, 0},
+    {0x8EA4, 0x0602, WORD_LEN, 0},
+    {0x8EA6, 0x2D41, WORD_LEN, 0},
+    {0x8EA8, 0x160C, WORD_LEN, 0},
+    {0x8EAA, 0x1934, WORD_LEN, 0},
+    {0x8EAC, 0x0082, WORD_LEN, 0},
+    {0x8EAE, 0x1930, WORD_LEN, 0},
+    {0x8EB0, 0x0302, WORD_LEN, 0},
+    {0x8EB2, 0x2B41, WORD_LEN, 0},
+    {0x8EB4, 0x0402, WORD_LEN, 0},
+    {0x8EB6, 0x2D41, WORD_LEN, 0},
+    {0x8EB8, 0x140C, WORD_LEN, 0},
+    {0x8EBA, 0x1935, WORD_LEN, 0},
+    {0x8EBC, 0x0082, WORD_LEN, 0},
+    {0x8EBE, 0x1931, WORD_LEN, 0},
+    {0x8EC0, 0x0302, WORD_LEN, 0},
+    {0x8EC2, 0x2B41, WORD_LEN, 0},
+    {0x8EC4, 0x0202, WORD_LEN, 0},
+    {0x8EC6, 0x2D41, WORD_LEN, 0},
+    {0x8EC8, 0x120C, WORD_LEN, 0},
+    {0x8ECA, 0x1936, WORD_LEN, 0},
+    {0x8ECC, 0x0082, WORD_LEN, 0},
+    {0x8ECE, 0x1932, WORD_LEN, 0},
+    {0x8ED0, 0x0302, WORD_LEN, 0},
+    {0x8ED2, 0x1937, WORD_LEN, 0},
+    {0x8ED4, 0x00C2, WORD_LEN, 0},
+    {0x8ED6, 0x1933, WORD_LEN, 0},
+    {0x8ED8, 0x0342, WORD_LEN, 0},
+    {0x8EDA, 0xD13B, WORD_LEN, 0},
+    {0x8EDC, 0x8120, WORD_LEN, 0},
+    {0x8EDE, 0x7208, WORD_LEN, 0},
+    {0x8EE0, 0x81A8, WORD_LEN, 0},
+    {0x8EE2, 0x7108, WORD_LEN, 0},
+    {0x8EE4, 0x7D60, WORD_LEN, 0},
+    {0x8EE6, 0x7308, WORD_LEN, 0},
+    {0x8EE8, 0xF003, WORD_LEN, 0},
+    {0x8EEA, 0x0D62, WORD_LEN, 0},
+    {0x8EEC, 0x0204, WORD_LEN, 0},
+    {0x8EEE, 0x03D9, WORD_LEN, 0},
+    {0x8EF0, 0x0684, WORD_LEN, 0},
+    {0x8EF2, 0x78E0, WORD_LEN, 0},
+    {0x8EF4, 0xC0F1, WORD_LEN, 0},
+    {0x8EF6, 0x0B52, WORD_LEN, 0},
+    {0x8EF8, 0x0684, WORD_LEN, 0},
+    {0x8EFA, 0xD532, WORD_LEN, 0},
+    {0x8EFC, 0xD733, WORD_LEN, 0},
+    {0x8EFE, 0x153A, WORD_LEN, 0},
+    {0x8F00, 0x1080, WORD_LEN, 0},
+    {0x8F02, 0x153B, WORD_LEN, 0},
+    {0x8F04, 0x1081, WORD_LEN, 0},
+    {0x8F06, 0x1528, WORD_LEN, 0},
+    {0x8F08, 0x108E, WORD_LEN, 0},
+    {0x8F0A, 0xB808, WORD_LEN, 0},
+    {0x8F0C, 0x7825, WORD_LEN, 0},
+    {0x8F0E, 0x703A, WORD_LEN, 0},
+    {0x8F10, 0x152A, WORD_LEN, 0},
+    {0x8F12, 0x1080, WORD_LEN, 0},
+    {0x8F14, 0x152B, WORD_LEN, 0},
+    {0x8F16, 0x1081, WORD_LEN, 0},
+    {0x8F18, 0xBE08, WORD_LEN, 0},
+    {0x8F1A, 0xB808, WORD_LEN, 0},
+    {0x8F1C, 0x7825, WORD_LEN, 0},
+    {0x8F1E, 0x701A, WORD_LEN, 0},
+    {0x8F20, 0x1529, WORD_LEN, 0},
+    {0x8F22, 0x1080, WORD_LEN, 0},
+    {0x8F24, 0x7E05, WORD_LEN, 0},
+    {0x8F26, 0x8700, WORD_LEN, 0},
+    {0x8F28, 0x800C, WORD_LEN, 0},
+    {0x8F2A, 0x7840, WORD_LEN, 0},
+    {0x8F2C, 0xD028, WORD_LEN, 0},
+    {0x8F2E, 0x153B, WORD_LEN, 0},
+    {0x8F30, 0x1082, WORD_LEN, 0},
+    {0x8F32, 0x9039, WORD_LEN, 0},
+    {0x8F34, 0x153A, WORD_LEN, 0},
+    {0x8F36, 0x1080, WORD_LEN, 0},
+    {0x8F38, 0xB808, WORD_LEN, 0},
+    {0x8F3A, 0x7845, WORD_LEN, 0},
+    {0x8F3C, 0x7822, WORD_LEN, 0},
+    {0x8F3E, 0xD11E, WORD_LEN, 0},
+    {0x8F40, 0x8120, WORD_LEN, 0},
+    {0x8F42, 0x912D, WORD_LEN, 0},
+    {0x8F44, 0x082F, WORD_LEN, 0},
+    {0x8F46, 0x0043, WORD_LEN, 0},
+    {0x8F48, 0x2941, WORD_LEN, 0},
+    {0x8F4A, 0x2201, WORD_LEN, 0},
+    {0x8F4C, 0x2E41, WORD_LEN, 0},
+    {0x8F4E, 0x1200, WORD_LEN, 0},
+    {0x8F50, 0x1D3A, WORD_LEN, 0},
+    {0x8F52, 0x1042, WORD_LEN, 0},
+    {0x8F54, 0x1D28, WORD_LEN, 0},
+    {0x8F56, 0x1002, WORD_LEN, 0},
+    {0x8F58, 0x8700, WORD_LEN, 0},
+    {0x8F5A, 0x2841, WORD_LEN, 0},
+    {0x8F5C, 0x2201, WORD_LEN, 0},
+    {0x8F5E, 0x1D3B, WORD_LEN, 0},
+    {0x8F60, 0x1442, WORD_LEN, 0},
+    {0x8F62, 0x1D2A, WORD_LEN, 0},
+    {0x8F64, 0x1042, WORD_LEN, 0},
+    {0x8F66, 0x800D, WORD_LEN, 0},
+    {0x8F68, 0x1D2B, WORD_LEN, 0},
+    {0x8F6A, 0x1402, WORD_LEN, 0},
+    {0x8F6C, 0x7860, WORD_LEN, 0},
+    {0x8F6E, 0x1D29, WORD_LEN, 0},
+    {0x8F70, 0x1382, WORD_LEN, 0},
+    {0x8F72, 0x0335, WORD_LEN, 0},
+    {0x8F74, 0x0684, WORD_LEN, 0},
+    {0x8F76, 0x78E0, WORD_LEN, 0},
+    {0x8F78, 0xC0F1, WORD_LEN, 0},
+    {0x8F7A, 0x0B6A, WORD_LEN, 0},
+    {0x8F7C, 0x01C4, WORD_LEN, 0},
+    {0x8F7E, 0xD215, WORD_LEN, 0},
+    {0x8F80, 0xD112, WORD_LEN, 0},
+    {0x8F82, 0xA140, WORD_LEN, 0},
+    {0x8F84, 0xC0D1, WORD_LEN, 0},
+    {0x8F86, 0x7EE0, WORD_LEN, 0},
+    {0x8F88, 0xC0F1, WORD_LEN, 0},
+    {0x8F8A, 0x0ACA, WORD_LEN, 0},
+    {0x8F8C, 0x06A4, WORD_LEN, 0},
+    {0x8F8E, 0xDA44, WORD_LEN, 0},
+    {0x8F90, 0xD111, WORD_LEN, 0},
+    {0x8F92, 0xD512, WORD_LEN, 0},
+    {0x8F94, 0x76A9, WORD_LEN, 0},
+    {0x8F96, 0x085E, WORD_LEN, 0},
+    {0x8F98, 0x06A4, WORD_LEN, 0},
+    {0x8F9A, 0x70C9, WORD_LEN, 0},
+    {0x8F9C, 0xD010, WORD_LEN, 0},
+    {0x8F9E, 0xA50D, WORD_LEN, 0},
+    {0x8FA0, 0xD010, WORD_LEN, 0},
+    {0x8FA2, 0xA50C, WORD_LEN, 0},
+    {0x8FA4, 0xD010, WORD_LEN, 0},
+    {0x8FA6, 0xA510, WORD_LEN, 0},
+    {0x8FA8, 0xD010, WORD_LEN, 0},
+    {0x8FAA, 0xA500, WORD_LEN, 0},
+    {0x8FAC, 0xD007, WORD_LEN, 0},
+    {0x8FAE, 0x0311, WORD_LEN, 0},
+    {0x8FB0, 0x06A4, WORD_LEN, 0},
+    {0x8FB2, 0xA0C0, WORD_LEN, 0},
+    {0x8FB4, 0x8000, WORD_LEN, 0},
+    {0x8FB6, 0x000C, WORD_LEN, 0},
+    {0x8FB8, 0xFF80, WORD_LEN, 0},
+    {0x8FBA, 0x040C, WORD_LEN, 0},
+    {0x8FBC, 0x8000, WORD_LEN, 0},
+    {0x8FBE, 0x00A8, WORD_LEN, 0},
+    {0x8FC0, 0xFF80, WORD_LEN, 0},
+    {0x8FC2, 0x0250, WORD_LEN, 0},
+    {0x8FC4, 0x8000, WORD_LEN, 0},
+    {0x8FC6, 0x0038, WORD_LEN, 0},
+    {0x8FC8, 0x8000, WORD_LEN, 0},
+    {0x8FCA, 0x00A4, WORD_LEN, 0},
+    {0x8FCC, 0xFF80, WORD_LEN, 0},
+    {0x8FCE, 0x0740, WORD_LEN, 0},
+    {0x8FD0, 0xFF80, WORD_LEN, 0},
+    {0x8FD2, 0x10C4, WORD_LEN, 0},
+    {0x8FD4, 0x0000, WORD_LEN, 0},
+    {0x8FD6, 0xF4BC, WORD_LEN, 0},
+    {0x8FD8, 0xFF80, WORD_LEN, 0},
+    {0x8FDA, 0x10C4, WORD_LEN, 0},
+    {0x8FDC, 0xFF80, WORD_LEN, 0},
+    {0x8FDE, 0x0E7C, WORD_LEN, 0},
+    {0x8FE0, 0xFF80, WORD_LEN, 0},
+    {0x8FE2, 0x0E10, WORD_LEN, 0},
+    {0x8FE4, 0xFF80, WORD_LEN, 0},
+    {0x8FE6, 0x0EF4, WORD_LEN, 0},
+    {0x8FE8, 0xFF80, WORD_LEN, 0},
+    {0x8FEA, 0x0F78, WORD_LEN, 0},
+    {0x8FEC, 0xEA0A, WORD_LEN, 0},
+    {0x8FEE, 0x242F, WORD_LEN, 0},
+    {0x8FF0, 0x7089, WORD_LEN, 0},
+    {0x8FF2, 0x78E0, WORD_LEN, 0},
+    {0x8FF4, 0x20A8, WORD_LEN, 0},
+    {0x8FF6, 0x0180, WORD_LEN, 0},
+    {0x8FF8, 0x1002, WORD_LEN, 0},
+    {0x8FFA, 0x0D02, WORD_LEN, 0},
+    {0x8FFC, 0x1902, WORD_LEN, 0},
+    {0x8FFE, 0x0094, WORD_LEN, 0},
+    {0x9000, 0x7FE0, WORD_LEN, 0},
+    {0x9002, 0x7028, WORD_LEN, 0},
+    {0x9004, 0x7308, WORD_LEN, 0},
+    {0x9006, 0x1000, WORD_LEN, 0},
+    {0x9008, 0x0900, WORD_LEN, 0},
+    {0x900A, 0x7904, WORD_LEN, 0},
+    {0x900C, 0x7947, WORD_LEN, 0},
+    {0x900E, 0x1B00, WORD_LEN, 0},
+    {0x9010, 0x0064, WORD_LEN, 0},
+    {0x9012, 0x7EE0, WORD_LEN, 0},
+    {0x9014, 0xEA0A, WORD_LEN, 0},
+    {0x9016, 0x242F, WORD_LEN, 0},
+    {0x9018, 0x7089, WORD_LEN, 0},
+    {0x901A, 0x78E0, WORD_LEN, 0},
+    {0x901C, 0x20A8, WORD_LEN, 0},
+    {0x901E, 0x0180, WORD_LEN, 0},
+    {0x9020, 0x1102, WORD_LEN, 0},
+    {0x9022, 0x0502, WORD_LEN, 0},
+    {0x9024, 0x1802, WORD_LEN, 0},
+    {0x9026, 0x00B4, WORD_LEN, 0},
+    {0x9028, 0x7FE0, WORD_LEN, 0},
+    {0x902A, 0x7028, WORD_LEN, 0},
+    {0x902C, 0x0000, WORD_LEN, 0},
+    {0x902E, 0x0000, WORD_LEN, 0},
+    {0x098E, 0x0016, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [MON_ADDRESS_LO]
+    {0x8016, 0x086C, WORD_LEN, 0}, 	// MON_ADDRESS_LO
+    {0x8002, 0x0001, WORD_LEN, 100}, 	// MON_CMD
+    //POLL_REG    {0x800A,0x00,!=0x07,DELAY=10,TIMEOUT=100	//Wait for the core ready
+    //char_settings		//tuning_reg_settings_array
+    {0x30D4, 0x9080, WORD_LEN, 0},  // COLUMN_CORRECTION
+    {0x316E, 0xC400, WORD_LEN, 0},  // DAC_ECL
+    {0x305E, 0x10A0, WORD_LEN, 0},  // GLOBAL_GAIN
+    {0x3E00, 0x0010, WORD_LEN, 0},  // SAMP_CONTROL
+    {0x3E02, 0xED02, WORD_LEN, 0},  // SAMP_ADDR_EN
+    {0x3E04, 0xC88C, WORD_LEN, 0},  // SAMP_RD1_SIG
+    {0x3E06, 0xC88C, WORD_LEN, 0},  // SAMP_RD1_SIG_BOOST
+    {0x3E08, 0x700A, WORD_LEN, 0},  // SAMP_RD1_RST
+    {0x3E0A, 0x701E, WORD_LEN, 0},  // SAMP_RD1_RST_BOOST
+    {0x3E0C, 0x00FF, WORD_LEN, 0},  // SAMP_RST1_EN
+    {0x3E0E, 0x00FF, WORD_LEN, 0},  // SAMP_RST1_BOOST
+    {0x3E10, 0x00FF, WORD_LEN, 0},  // SAMP_RST1_CLOOP_SH
+    {0x3E12, 0x0000, WORD_LEN, 0},  // SAMP_RST_BOOST_SEQ
+    {0x3E14, 0xC78C, WORD_LEN, 0},  // SAMP_SAMP1_SIG
+    {0x3E16, 0x6E06, WORD_LEN, 0},  // SAMP_SAMP1_RST
+    {0x3E18, 0xA58C, WORD_LEN, 0},  // SAMP_TX_EN
+    {0x3E1A, 0xA58E, WORD_LEN, 0},  // SAMP_TX_BOOST
+    {0x3E1C, 0xA58E, WORD_LEN, 0},  // SAMP_TX_CLOOP_SH
+    {0x3E1E, 0xC0D0, WORD_LEN, 0},  // SAMP_TX_BOOST_SEQ
+    {0x3E20, 0xEB00, WORD_LEN, 0},  // SAMP_VLN_EN
+    {0x3E22, 0x00FF, WORD_LEN, 0},  // SAMP_VLN_HOLD
+    {0x3E24, 0xEB02, WORD_LEN, 0},  // SAMP_VCL_EN
+    {0x3E26, 0xEA02, WORD_LEN, 0},  // SAMP_COLCLAMP
+    {0x3E28, 0xEB0A, WORD_LEN, 0},  // SAMP_SH_VCL
+    {0x3E2A, 0xEC01, WORD_LEN, 0},  // SAMP_SH_VREF
+    {0x3E2C, 0xEB01, WORD_LEN, 0},  // SAMP_SH_VBST
+    {0x3E2E, 0x00FF, WORD_LEN, 0},  // SAMP_SPARE
+    {0x3E30, 0x00F3, WORD_LEN, 0},  // SAMP_READOUT
+    {0x3E32, 0x3DFA, WORD_LEN, 0},  // SAMP_RESET_DONE
+    {0x3E34, 0x00FF, WORD_LEN, 0},  // SAMP_VLN_CLAMP
+    {0x3E36, 0x00F3, WORD_LEN, 0},  // SAMP_ASC_INT
+    {0x3E38, 0x0000, WORD_LEN, 0},  // SAMP_RS_CLOOP_SH_R
+    {0x3E3A, 0xF802, WORD_LEN, 0},  // SAMP_RS_CLOOP_SH
+    {0x3E3C, 0x0FFF, WORD_LEN, 0},  // SAMP_RS_BOOST_SEQ
+    {0x3E3E, 0xEA10, WORD_LEN, 0},  // SAMP_TXLO_GND
+    {0x3E40, 0xEB05, WORD_LEN, 0},  // SAMP_VLN_PER_COL
+    {0x3E42, 0xE5C8, WORD_LEN, 0},  // SAMP_RD2_SIG
+    {0x3E44, 0xE5C8, WORD_LEN, 0},  // SAMP_RD2_SIG_BOOST
+    {0x3E46, 0x8C70, WORD_LEN, 0},  // SAMP_RD2_RST
+    {0x3E48, 0x8C71, WORD_LEN, 0},  // SAMP_RD2_RST_BOOST
+    {0x3E4A, 0x00FF, WORD_LEN, 0},  // SAMP_RST2_EN
+    {0x3E4C, 0x00FF, WORD_LEN, 0},  // SAMP_RST2_BOOST
+    {0x3E4E, 0x00FF, WORD_LEN, 0},  // SAMP_RST2_CLOOP_SH
+    {0x3E50, 0xE38D, WORD_LEN, 0},  // SAMP_SAMP2_SIG
+    {0x3E52, 0x8B0A, WORD_LEN, 0},  // SAMP_SAMP2_RST
+    {0x3E58, 0xEB0A, WORD_LEN, 0},  // SAMP_PIX_CLAMP_EN
+    {0x3E5C, 0x0A00, WORD_LEN, 0},  // SAMP_PIX_PULLUP_EN
+    {0x3E5E, 0x00FF, WORD_LEN, 0},  // SAMP_PIX_PULLDOWN_EN_R
+    {0x3E60, 0x00FF, WORD_LEN, 0},  // SAMP_PIX_PULLDOWN_EN_S
+    {0x3E90, 0x3C01, WORD_LEN, 0},  // RST_ADDR_EN
+    {0x3E92, 0x00FF, WORD_LEN, 0},  // RST_RST_EN
+    {0x3E94, 0x00FF, WORD_LEN, 0},  // RST_RST_BOOST
+    {0x3E96, 0x3C00, WORD_LEN, 0},  // RST_TX_EN
+    {0x3E98, 0x3C00, WORD_LEN, 0},  // RST_TX_BOOST
+    {0x3E9A, 0x3C00, WORD_LEN, 0},  // RST_TX_CLOOP_SH
+    {0x3E9C, 0xC0E0, WORD_LEN, 0},  // RST_TX_BOOST_SEQ
+    {0x3E9E, 0x00FF, WORD_LEN, 0},  // RST_RST_CLOOP_SH
+    {0x3EA0, 0x0000, WORD_LEN, 0},  // RST_RST_BOOST_SEQ
+    {0x3EA6, 0x3C00, WORD_LEN, 0},  // RST_PIX_PULLUP_EN
+    {0x3ED8, 0x3057, WORD_LEN, 0},  // DAC_LD_12_13
+    {0x316C, 0xB44F, WORD_LEN, 0},  // DAC_TXLO
+    {0x316E, 0xC6FF, WORD_LEN, 0},  // DAC_ECL
+    {0x3ED2, 0xEA0A, WORD_LEN, 0},  // DAC_LD_6_7
+    {0x3ED4, 0x00A3, WORD_LEN, 0},  // DAC_LD_8_9
+    {0x3EDC, 0x6020, WORD_LEN, 0},  // DAC_LD_16_17
+    {0x3EE6, 0xA541, WORD_LEN, 0},  // DAC_LD_26_27
+    {0x31E0, 0x0000, WORD_LEN, 0},  // PIX_DEF_ID
+    {0x3ED0, 0x2409, WORD_LEN, 0},  // DAC_LD_4_5
+    {0x3EDE, 0x0A49, WORD_LEN, 0}, // DAC_LD_18_19
+    {0x3EE0, 0x4910, WORD_LEN, 0},  // DAC_LD_20_21
+    {0x3EE2, 0x09D2, WORD_LEN, 0},  // DAC_LD_22_23
+    {0x30B6, 0x0008, WORD_LEN, 0},  // AUTOLR_CONTROL
+    {0x337C, 0x000F, WORD_LEN, 0},  // YUV_YCBCR_CONTROL
+    {0x3E1A, 0xA582, WORD_LEN, 0},  // SAMP_TX_BOOST
+    {0x3E2E, 0xEC05, WORD_LEN, 0},  // SAMP_SPARE
+    {0x3EE6, 0xA5C0, WORD_LEN, 0},  // DAC_LD_26_27
+    {0x316C, 0xB43F, WORD_LEN, 0},  // DAC_TXLO
+    {0x316E, 0xC6FF, WORD_LEN, 0},  // DAC_ECL
+    //[Lens Correction 85%]					 											
+    {0x3640, 0x01F0, WORD_LEN, 0}, 	//  P_G1_P0Q0
+    {0x3642, 0x1F6E, WORD_LEN, 0}, 	//  P_G1_P0Q1
+    {0x3644, 0x2191, WORD_LEN, 0}, 	//  P_G1_P0Q2
+    {0x3646, 0xB78E, WORD_LEN, 0}, 	//  P_G1_P0Q3
+    {0x3648, 0x8231, WORD_LEN, 0}, 	//  P_G1_P0Q4
+    {0x364A, 0x02B0, WORD_LEN, 0}, 	//  P_R_P0Q0
+    {0x364C, 0xE4EC, WORD_LEN, 0}, 	//  P_R_P0Q1
+    {0x364E, 0x0131, WORD_LEN, 0}, 	//  P_R_P0Q2
+    {0x3650, 0x44CD, WORD_LEN, 0},	//  P_R_P0Q3
+    {0x3652, 0x8A91, WORD_LEN, 0}, 	//  P_R_P0Q4
+    {0x3654, 0x0330, WORD_LEN, 0}, 	//  P_B_P0Q0
+    {0x3656, 0x6F8D, WORD_LEN, 0}, 	//  P_B_P0Q1
+    {0x3658, 0x3B10, WORD_LEN, 0}, 	//  P_B_P0Q2
+    {0x365A, 0xA42E, WORD_LEN, 0},	//  P_B_P0Q3
+    {0x365C, 0xA2D0, WORD_LEN, 0}, 	//  P_B_P0Q4
+    {0x365E, 0x01B0, WORD_LEN, 0}, 	//  P_G2_P0Q0
+    {0x3660, 0x864D, WORD_LEN, 0}, 	//  P_G2_P0Q1
+    {0x3662, 0x20F1, WORD_LEN, 0}, 	//  P_G2_P0Q2
+    {0x3664, 0xCFAB, WORD_LEN, 0}, 	//  P_G2_P0Q3
+    {0x3666, 0x86D1, WORD_LEN, 0}, 	//  P_G2_P0Q4
+    {0x3680, 0x4ECA, WORD_LEN, 0}, 	//  P_G1_P1Q0
+    {0x3682, 0x980E, WORD_LEN, 0}, 	//  P_G1_P1Q1
+    {0x3684, 0x852D, WORD_LEN, 0}, 	//  P_G1_P1Q2
+    {0x3686, 0x6D0E, WORD_LEN, 0}, 	//  P_G1_P1Q3
+    {0x3688, 0x8D4C, WORD_LEN, 0},	//  P_G1_P1Q4
+    {0x368A, 0x61ED, WORD_LEN, 0}, 	//  P_R_P1Q0
+    {0x368C, 0x010D, WORD_LEN, 0}, 	//  P_R_P1Q1
+    {0x368E, 0x58CD, WORD_LEN, 0}, 	//  P_R_P1Q2
+    {0x3690, 0xFA4D, WORD_LEN, 0}, 	//  P_R_P1Q3
+    {0x3692, 0xCE6F, WORD_LEN, 0}, 	//  P_R_P1Q4
+    {0x3694, 0xCEAD, WORD_LEN, 0}, 	//  P_B_P1Q0
+    {0x3696, 0x650D, WORD_LEN, 0},	//  P_B_P1Q1
+    {0x3698, 0x630E, WORD_LEN, 0}, 	//  P_B_P1Q2
+    {0x369A, 0x81CF, WORD_LEN, 0}, 	//  P_B_P1Q3
+    {0x369C, 0x9BCF, WORD_LEN, 0}, 	//  P_B_P1Q4
+    {0x369E, 0x982C, WORD_LEN, 0}, 	//  P_G2_P1Q0
+    {0x36A0, 0xABCE, WORD_LEN, 0}, 	//  P_G2_P1Q1
+    {0x36A2, 0x7DAD, WORD_LEN, 0}, 	//  P_G2_P1Q2
+    {0x36A4, 0x682E, WORD_LEN, 0}, 	//  P_G2_P1Q3
+    {0x36A6, 0xED4E, WORD_LEN, 0}, 	//  P_G2_P1Q4
+    {0x36C0, 0x2131, WORD_LEN, 0}, 	//  P_G1_P2Q0
+    {0x36C2, 0x66CD, WORD_LEN, 0}, 	//  P_G1_P2Q1
+    {0x36C4, 0x0FF1, WORD_LEN, 0}, 	//  P_G1_P2Q2
+    {0x36C6, 0xD3EF, WORD_LEN, 0}, 	//  P_G1_P2Q3
+    {0x36C8, 0xEF53, WORD_LEN, 0}, 	//  P_G1_P2Q4
+    {0x36CA, 0x11D1, WORD_LEN, 0}, 	//  P_R_P2Q0
+    {0x36CC, 0xD44E, WORD_LEN, 0}, 	//  P_R_P2Q1
+    {0x36CE, 0x1770, WORD_LEN, 0}, 	//  P_R_P2Q2
+    {0x36D0, 0x9DAE, WORD_LEN, 0}, 	//  P_R_P2Q3
+    {0x36D2, 0x9DF3, WORD_LEN, 0}, 	//  P_R_P2Q4
+    {0x36D4, 0x1251, WORD_LEN, 0}, 	//  P_B_P2Q0
+    {0x36D6, 0x5B4E, WORD_LEN, 0}, 	//  P_B_P2Q1
+    {0x36D8, 0x6ACF, WORD_LEN, 0}, 	//  P_B_P2Q2
+    {0x36DA, 0x8AEF, WORD_LEN, 0}, 	//  P_B_P2Q3
+    {0x36DC, 0xFE52, WORD_LEN, 0}, 	//  P_B_P2Q4
+    {0x36DE, 0x2991, WORD_LEN, 0}, 	//  P_G2_P2Q0
+    {0x36E0, 0x9E6F, WORD_LEN, 0},	//  P_G2_P2Q1
+    {0x36E2, 0x0EB1, WORD_LEN, 0}, 	//  P_G2_P2Q2
+    {0x36E4, 0x3CCD, WORD_LEN, 0}, 	//  P_G2_P2Q3
+    {0x36E6, 0xED93, WORD_LEN, 0}, 	//  P_G2_P2Q4
+    {0x3700, 0x22CE, WORD_LEN, 0}, 	//  P_G1_P3Q0
+    {0x3702, 0x79AE, WORD_LEN, 0}, 	//  P_G1_P3Q1
+    {0x3704, 0xAF30, WORD_LEN, 0}, 	//  P_G1_P3Q2
+    {0x3706, 0xC70F, WORD_LEN, 0}, 	//  P_G1_P3Q3
+    {0x3708, 0x4091, WORD_LEN, 0}, 	//  P_G1_P3Q4
+    {0x370A, 0x76CE, WORD_LEN, 0}, 	//  P_R_P3Q0
+    {0x370C, 0x69AD, WORD_LEN, 0}, 	//  P_R_P3Q1
+    {0x370E, 0xB611, WORD_LEN, 0}, 	//  P_R_P3Q2
+    {0x3710, 0xCC0B, WORD_LEN, 0}, 	//  P_R_P3Q3
+    {0x3712, 0x2512, WORD_LEN, 0}, 	//  P_R_P3Q4
+    {0x3714, 0x856E, WORD_LEN, 0}, 	//  P_B_P3Q0
+    {0x3716, 0xA24D, WORD_LEN, 0}, 	//  P_B_P3Q1
+    {0x3718, 0x2090, WORD_LEN, 0}, 	//  P_B_P3Q2
+    {0x371A, 0x0430, WORD_LEN, 0}, 	//  P_B_P3Q3
+    {0x371C, 0xE9B0, WORD_LEN, 0}, 	//  P_B_P3Q4
+    {0x371E, 0xD14C, WORD_LEN, 0}, 	//  P_G2_P3Q0
+    {0x3720, 0x154E, WORD_LEN, 0}, 	//  P_G2_P3Q1
+    {0x3722, 0x2F0F, WORD_LEN, 0}, 	//  P_G2_P3Q2
+    {0x3724, 0xD8CD, WORD_LEN, 0}, 	//  P_G2_P3Q3
+    {0x3726, 0x806F, WORD_LEN, 0}, 	//  P_G2_P3Q4
+    {0x3740, 0xC30F, WORD_LEN, 0}, 	//  P_G1_P4Q0
+    {0x3742, 0xACF0, WORD_LEN, 0}, 	//  P_G1_P4Q1
+    {0x3744, 0x8375, WORD_LEN, 0}, 	//  P_G1_P4Q2
+    {0x3746, 0x6871, WORD_LEN, 0}, 	//  P_G1_P4Q3
+    {0x3748, 0x30B6, WORD_LEN, 0}, 	//  P_G1_P4Q4
+    {0x374A, 0x8770, WORD_LEN, 0}, 	//  P_R_P4Q0
+    {0x374C, 0x96ED, WORD_LEN, 0}, 	//  P_R_P4Q1
+    {0x374E, 0xC274, WORD_LEN, 0}, 	//  P_R_P4Q2
+    {0x3750, 0x61B1, WORD_LEN, 0}, 	//  P_R_P4Q3
+    {0x3752, 0x0BF6, WORD_LEN, 0}, 	//  P_R_P4Q4
+    {0x3754, 0x8DB1, WORD_LEN, 0}, 	//  P_B_P4Q0
+    {0x3756, 0xC850, WORD_LEN, 0}, 	//  P_B_P4Q1
+    {0x3758, 0xA2B4, WORD_LEN, 0}, 	//  P_B_P4Q2
+    {0x375A, 0x3C11, WORD_LEN, 0}, 	//  P_B_P4Q3
+    {0x375C, 0x7D55, WORD_LEN, 0}, 	//  P_B_P4Q4
+    {0x375E, 0x96AF, WORD_LEN, 0}, 	//  P_G2_P4Q0
+    {0x3760, 0x3F6F, WORD_LEN, 0}, 	//  P_G2_P4Q1
+    {0x3762, 0x8395, WORD_LEN, 0}, 	//  P_G2_P4Q2
+    {0x3764, 0x5010, WORD_LEN, 0}, 	//  P_G2_P4Q3
+    {0x3766, 0x2E96, WORD_LEN, 0}, 	//  P_G2_P4Q4
+    {0x3784, 0x0508, WORD_LEN, 0}, 	//  CENTER_COLUMN
+    {0x3782, 0x03C8, WORD_LEN, 0}, 	//  CENTER_ROW																
+    {0x3210, 0x49B8, WORD_LEN, 0},  // COLOR_PIPELINE_CONTROL
+    //static struct isx006_register_address_value_pair const
+    //[Step5-AWB_CCM]
+    //awb_setup
+    {0xAC02, 0x00FF, WORD_LEN, 0},  // AWB_ALGO
+    {0xAC01, 0x7F, BYTE_LEN, 0},  // AWB_MODE
+    //preawb_params
+    {0xAC3C, 0x39, BYTE_LEN, 0},  //42  // AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO
+    {0xAC3D, 0x6E, BYTE_LEN, 0},  //50  // AWB_MAX_ACCEPTED_PRE_AWB_R2G_RATIO
+    {0xAC3E, 0x28, BYTE_LEN, 0},  //13  // AWB_MIN_ACCEPTED_PRE_AWB_B2G_RATIO
+    {0xAC3F, 0x6B, BYTE_LEN, 0},  //5B  // AWB_MAX_ACCEPTED_PRE_AWB_B2G_RATIO
+    {0xAC40, 0x64, BYTE_LEN, 0},  //52  // AWB_MIN_ACCEPTED_POST_AWB_R2G_RATIO
+    {0xAC41, 0x66, BYTE_LEN, 0},  //56  // AWB_MAX_ACCEPTED_POST_AWB_R2G_RATIO
+    {0xAC42, 0x64, BYTE_LEN, 0},  // AWB_MIN_ACCEPTED_POST_AWB_B2G_RATIO
+    {0xAC43, 0x66, BYTE_LEN, 0},  // AWB_MAX_ACCEPTED_POST_AWB_B2G_RATIO
+    //awb_patch
+    {0xACB0, 0x31, BYTE_LEN, 0},  // AWB_RG_MIN
+    {0xACB1, 0x50, BYTE_LEN, 0},  // AWB_RG_MAX
+    {0xACB4, 0x13, BYTE_LEN, 0},  // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},  // AWB_BG_MAX
+    {0xACB2, 0x3A, BYTE_LEN, 0},  //3E  //3A  // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x41, BYTE_LEN, 0},  //3E  // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x47, BYTE_LEN, 0},  //3F  //44  // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4E, BYTE_LEN, 0},  //42  //48  // AWB_BG_MAX_BRIGHT
+    {0xACB8, 0x0100, WORD_LEN, 0},  // AWB_START_NUM_INT_LINES
+    {0xACBA, 0x00B0, WORD_LEN, 0},  // AWB_END_NUM_INT_LINES
+															 //bright_DNP_patch
+    {0x098E, 0xAC09, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS
+    {0xAC09, 0x01, BYTE_LEN, 0},  // AWB_UNUSED1
+    {0xAC22, 0x0000, WORD_LEN, 0},  //1 //0   // AWB_UNUSED2  AWB_sharpness_th
+																 //ccm
+    {0xAC46, 0x0236, WORD_LEN, 0},  // AWB_LEFT_CCM_0
+    {0xAC48, 0xFE9D, WORD_LEN, 0},  // AWB_LEFT_CCM_1
+    {0xAC4A, 0x002C, WORD_LEN, 0},  // AWB_LEFT_CCM_2
+    {0xAC4C, 0xFFAA, WORD_LEN, 0},  // AWB_LEFT_CCM_3
+    {0xAC4E, 0x00F9, WORD_LEN, 0},  // AWB_LEFT_CCM_4
+    {0xAC50, 0x005E, WORD_LEN, 0},  // AWB_LEFT_CCM_5
+    {0xAC52, 0xFFE7, WORD_LEN, 0},  // AWB_LEFT_CCM_6
+    {0xAC54, 0xFD42, WORD_LEN, 0},  // AWB_LEFT_CCM_7
+    {0xAC56, 0x03D7, WORD_LEN, 0},  // AWB_LEFT_CCM_8
+    {0xAC58, 0x00C6, WORD_LEN, 0},  // AWB_LEFT_CCM_R2BRATIO
+    {0xAC5C, 0x02D2, WORD_LEN, 0},  // AWB_RIGHT_CCM_0
+    {0xAC5E, 0xFE11, WORD_LEN, 0},  // AWB_RIGHT_CCM_1
+    {0xAC60, 0x001D, WORD_LEN, 0},  // AWB_RIGHT_CCM_2
+    {0xAC62, 0xFF98, WORD_LEN, 0},  // AWB_RIGHT_CCM_3
+    {0xAC64, 0x013F, WORD_LEN, 0},  // AWB_RIGHT_CCM_4
+    {0xAC66, 0x002B, WORD_LEN, 0},  // AWB_RIGHT_CCM_5
+    {0xAC68, 0xFFD6, WORD_LEN, 0},  // AWB_RIGHT_CCM_6
+    {0xAC6A, 0xFEDA, WORD_LEN, 0},  // AWB_RIGHT_CCM_7
+    {0xAC6C, 0x024F, WORD_LEN, 0},  // AWB_RIGHT_CCM_8
+    {0xAC6E, 0x0069, WORD_LEN, 0},  // AWB_RIGHT_CCM_R2BRATIO
+    {0xB83E, 0x00, BYTE_LEN, 0},  // STAT_AWB_WINDOW_POS_X
+    {0xB83F, 0x00, BYTE_LEN, 0},  // STAT_AWB_WINDOW_POS_Y
+    {0xB840, 0xFF, BYTE_LEN, 0},  // STAT_AWB_WINDOW_SIZE_X
+    {0xB841, 0xEF, BYTE_LEN, 0},  // STAT_AWB_WINDOW_SIZE_Y
+    //    {0x8404, 0x05, 16:8	// SEQ_CMD 							 //0x8404, 0x05,  // SEQ_CMD
+    //weighted2D_AWB_settings
+    {0xB842, 0x0039, WORD_LEN, 0},  //36  //39  // STAT_AWB_GRAY_CHECKER_OFFSET_X
+    {0xB844, 0x002F, WORD_LEN, 0},  //3D  //2F  // STAT_AWB_GRAY_CHECKER_OFFSET_Y
+    {0x3240, 0x0024, WORD_LEN, 0},  // AWB_XY_SCALE
+    {0x3242, 0x0000, WORD_LEN, 0},  // AWB_WEIGHT_R0
+    {0x3244, 0x1550, WORD_LEN, 0},  // AWB_WEIGHT_R1
+    {0x3246, 0x1F00, WORD_LEN, 0},  // AWB_WEIGHT_R2
+    {0x3248, 0x7380, WORD_LEN, 0},  // AWB_WEIGHT_R3
+    {0x324A, 0x70E0, WORD_LEN, 0},  // AWB_WEIGHT_R4
+    {0x324C, 0x01F0, WORD_LEN, 0},  // AWB_WEIGHT_R5
+    {0x324E, 0x006B, WORD_LEN, 0},  // AWB_WEIGHT_R6
+    {0x3250, 0x0055, WORD_LEN, 0},  // AWB_WEIGHT_R7
+										 						 //dark_ccm_settings
+    {0xAC72, 0x004D, WORD_LEN, 0},  // AWB_LL_CCM_0
+    {0xAC74, 0x0096, WORD_LEN, 0},  // AWB_LL_CCM_1
+    {0xAC76, 0x001D, WORD_LEN, 0},  // AWB_LL_CCM_2
+    {0xAC78, 0x004D, WORD_LEN, 0},  // AWB_LL_CCM_3
+    {0xAC7A, 0x0096, WORD_LEN, 0},  // AWB_LL_CCM_4
+    {0xAC7C, 0x001D, WORD_LEN, 0},  // AWB_LL_CCM_5
+    {0xAC7E, 0x004D, WORD_LEN, 0},  // AWB_LL_CCM_6
+    {0xAC80, 0x0096, WORD_LEN, 0},  // AWB_LL_CCM_7
+    {0xAC82, 0x001D, WORD_LEN, 0},  // AWB_LL_CCM_8
+																 //[Step6-CPIPE_Calibration]
+																 //jpeg_setup
+    {0xD80F, 0x04, BYTE_LEN, 0},    //16:8	//16  // JPEG_QSCALE_0
+    {0xD810, 0x08, BYTE_LEN, 0},    //16:8	//16  // JPEG_QSCALE_1
+    {0xC8D2, 0x04, BYTE_LEN, 0},    //16:8	//16  // CAM_OUTPUT_1_JPEG_QSCALE_0
+    {0xC8D3, 0x08, BYTE_LEN, 0},    //16:8	//16  // CAM_OUTPUT_1_JPEG_QSCALE_1
+    {0xC8BC, 0x04, BYTE_LEN, 0},    //16:8	//16  // CAM_OUTPUT_0_JPEG_QSCALE_0
+    {0xC8BD, 0x08, BYTE_LEN, 0},    //16:8	//16  // CAM_OUTPUT_0_JPEG_QSCALE_1
+																 //sys_settings
+    {0x301A, 0x10F4, WORD_LEN, 0},  // RESET_REGISTER
+    {0x301E, 0x0083, WORD_LEN, 0},  // DATA_PEDESTAL
+    {0x301A, 0x10FC, WORD_LEN, 0},  // RESET_REGISTER
+    {0xDC33, 0x20, BYTE_LEN, 0},  // SYS_FIRST_BLACK_LEVEL
+    {0xDC35, 0x04, BYTE_LEN, 0},  // SYS_UV_COLOR_BOOST
+    {0x326E, 0x0006, WORD_LEN, 0},  // LOW_PASS_YUV_FILTER
+    {0xDC37, 0x62, BYTE_LEN, 0},  // SYS_BRIGHT_COLORKILL
+    {0x35A4, 0x0596, WORD_LEN, 0},  // BRIGHT_COLOR_KILL_CONTROLS
+    {0x35A2, 0x0094, WORD_LEN, 0},  // DARK_COLOR_KILL_CONTROLS
+    {0xDC36, 0x24, BYTE_LEN, 0},  // SYS_DARK_COLOR_KILL
+    //;{ 0x8404, 0x06  // SEQ_CMD
+    //;POLL_FIELD= SEQ_CMD, !=0, DELAY= 10, TIMEOUT= 20
+    //gamma
+    {0xBC18, 0x00, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_0
+    {0xBC19, 0x06, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_1
+    {0xBC1A, 0x14, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_2
+    {0xBC1B, 0x31, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_3
+    {0xBC1C, 0x53, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_4
+    {0xBC1D, 0x6E, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_5
+    {0xBC1E, 0x84, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_6
+    {0xBC1F, 0x98, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_7
+    {0xBC20, 0xA7, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_8
+    {0xBC21, 0xB5, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_9
+    {0xBC22, 0xC1, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_10
+    {0xBC23, 0xCB, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_11
+    {0xBC24, 0xD5, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_12
+    {0xBC25, 0xDD, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_13
+    {0xBC26, 0xE5, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_14
+    {0xBC27, 0xEC, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_15
+    {0xBC28, 0xF3, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_16
+    {0xBC29, 0xF9, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_17
+    {0xBC2A, 0xFF, BYTE_LEN, 0},  // LL_GAMMA_CONTRAST_CURVE_18
+    {0xBC2B, 0x00, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x06, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x14, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x31, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x53, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6E, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x84, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x98, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA7, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB5, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC1, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xCB, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD5, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDD, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE5, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEC, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF3, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},  // LL_GAMMA_NEUTRAL_CURVE_18
+    {0xBC3E, 0x00, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_0
+    {0xBC3F, 0x07, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_1
+    {0xBC40, 0x16, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_2
+    {0xBC41, 0x30, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_3
+    {0xBC42, 0x4F, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_4
+    {0xBC43, 0x67, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_5
+    {0xBC44, 0x7A, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_6
+    {0xBC45, 0x8C, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_7
+    {0xBC46, 0x9B, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_8
+    {0xBC47, 0xA9, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_9
+    {0xBC48, 0xB5, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_10
+    {0xBC49, 0xC1, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_11
+    {0xBC4A, 0xCB, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_12
+    {0xBC4B, 0xD5, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_13
+    {0xBC4C, 0xDE, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_14
+    {0xBC4D, 0xE7, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_15
+    {0xBC4E, 0xEF, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_16
+    {0xBC4F, 0xF7, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_17
+    {0xBC50, 0xFF, BYTE_LEN, 0},  // LL_GAMMA_NR_CURVE_18
+    //0x8404, 0x06,  // SEQ_CMD
+    //POLL_FIELD= SEQ_CMD, !=0, DELAY= 10, TIMEOUT= 20
+																 
+    //0xFFFE, 0x8404, 0x00,
+    //BM_dampening
+    {0xB801, 0xE0, BYTE_LEN, 0},  // STAT_MODE
+    {0xB862, 0x04, BYTE_LEN, 0},  // STAT_BMTRACKING_SPEED
+    //AE
+    {0xB829, 0x02, BYTE_LEN, 0},  // STAT_LL_BRIGHTNESS_METRIC_DIVISOR
+    {0xB863, 0x02, BYTE_LEN, 0},  // STAT_BM_MUL
+    {0xB827, 0x0F, BYTE_LEN, 0},  // STAT_AE_EV_SHIFT
+    {0xA409, 0x48, BYTE_LEN, 0},  // AE_RULE_BASE_TARGET
+    {0xA801, 0x00, BYTE_LEN, 0}, 	// AE_TRACK_MODE
+    {0xA805, 0x0A, BYTE_LEN, 0},	//, BYTE_LEN, 0},  // AE_TRACK_GATE
+    {0xA80E, 0x1A, BYTE_LEN, 0},  //14  // AE_TRACK_MAX_BLACK_LEVEL
+    {0xA401, 0x00, BYTE_LEN, 0},  // AE_RULE_MODE
+    //BM_GM_start_stop
+    {0xBC52, 0x00C8, WORD_LEN, 0},  // LL_START_BRIGHTNESS_METRIC
+    {0xBC54, 0x0A28, WORD_LEN, 0},  // LL_END_BRIGHTNESS_METRIC
+    {0xBC58, 0x00FA, WORD_LEN, 0},  //C8  // LL_START_GAIN_METRIC
+    {0xBC5A, 0x0400, WORD_LEN, 0},  //12C0  // LL_END_GAIN_METRIC
+    {0xBC5E, 0x00FA, WORD_LEN, 0},  // LL_START_APERTURE_GAIN_BM
+    {0xBC60, 0x0258, WORD_LEN, 0},  // LL_END_APERTURE_GAIN_BM
+    {0xBC66, 0x0154, WORD_LEN, 0},  //0FA   // LL_START_APERTURE_GM
+    {0xBC68, 0x0390, WORD_LEN, 0},  //258   // LL_END_APERTURE_GM
+    {0xBC86, 0x00FA, WORD_LEN, 0},  //C8  // LL_START_FFNR_GM
+    {0xBC88, 0x0390, WORD_LEN, 0},  //640   // LL_END_FFNR_GM
+    {0xBCBC, 0x0040, WORD_LEN, 0},  // LL_SFFB_START_GAIN
+    {0xBCBE, 0x01FC, WORD_LEN, 0},  // LL_SFFB_END_GAIN
+    {0xBCCC, 0x00C8, WORD_LEN, 0},  // LL_SFFB_START_MAX_GM
+    {0xBCCE, 0x0390, WORD_LEN, 0},  //640   // LL_SFFB_END_MAX_GM
+    {0xBC90, 0x00FA, WORD_LEN, 0},  //C8  // LL_START_GRB_GM
+    {0xBC92, 0x0390, WORD_LEN, 0},  //640   // LL_END_GRB_GM
+    {0x098E, 0x3C0E, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS
+    {0xBC0E, 0x0001, WORD_LEN, 0},  // LL_GAMMA_CURVE_ADJ_START_POS
+    {0xBC10, 0x00F0, WORD_LEN, 0},  // LL_GAMMA_CURVE_ADJ_MID_POS
+    {0xBC12, 0x0640, WORD_LEN, 0},  // LL_GAMMA_CURVE_ADJ_END_POS
+    {0xBCAA, 0x044C, WORD_LEN, 0},  // LL_CDC_THR_ADJ_START_POS
+    {0xBCAC, 0x00AF, WORD_LEN, 0},  // LL_CDC_THR_ADJ_MID_POS
+    {0xBCAE, 0x0009, WORD_LEN, 0},  // LL_CDC_THR_ADJ_END_POS
+    {0xBCD8, 0x0154, WORD_LEN, 0},  //0C8   // LL_PCR_START_BM
+    {0xBCDA, 0x0A28, WORD_LEN, 0},  // LL_PCR_END_BM
+    //kernel
+    {0x3380, 0x0504, WORD_LEN, 0},  // KERNEL_CONFIG
+    //GRB
+    {0xBC94, 0x12, BYTE_LEN, 0},  // LL_GB_START_THRESHOLD_0
+    {0xBC95, 0x0C, BYTE_LEN, 0},  // LL_GB_START_THRESHOLD_1
+    {0xBC9C, 0x37, BYTE_LEN, 0},  // LL_GB_END_THRESHOLD_0
+    {0xBC9D, 0x24, BYTE_LEN, 0},  // LL_GB_END_THRESHOLD_1
+    //demosaic
+    {0x33B0, 0x2A16, WORD_LEN, 0},  // FFNR_ALPHA_BETA
+    {0xBC8A, 0x00, BYTE_LEN, 0},  // LL_START_FF_MIX_THRESH_Y
+    {0xBC8B, 0x28, BYTE_LEN, 0},  // LL_END_FF_MIX_THRESH_Y
+    {0xBC8C, 0x00, BYTE_LEN, 0},  //1   // LL_START_FF_MIX_THRESH_YGAIN
+    {0xBC8D, 0x01, BYTE_LEN, 0},  //28  // LL_END_FF_MIX_THRESH_YGAIN
+    {0xBC8E, 0x1F, BYTE_LEN, 0},  //18  //0A  // LL_START_FF_MIX_THRESH_GAIN
+    {0xBC8F, 0x00, BYTE_LEN, 0},  // LL_END_FF_MIX_THRESH_GAIN
+    //SFFB_rev3_noisemodel
+    {0xBCC0, 0x20, BYTE_LEN, 0},  //2F  //1F  // LL_SFFB_RAMP_START
+    {0xBCC1, 0x03, BYTE_LEN, 0},  // LL_SFFB_RAMP_STOP
+    {0xBCC2, 0x1E, BYTE_LEN, 0},  //3C  //1E  // LL_SFFB_SLOPE_START
+    {0xBCC3, 0x0F, BYTE_LEN, 0},  // LL_SFFB_SLOPE_STOP
+    {0xBCC4, 0x0A, BYTE_LEN, 0},  //FF  //0A  // LL_SFFB_THSTART
+    {0xBCC5, 0xAF, BYTE_LEN, 0},  //0F  // LL_SFFB_THSTOP
+    {0xBCBA, 0x0009, WORD_LEN, 0},  // LL_SFFB_CONFIG
+    //[Step7-CPIPE_Preference]
+    //ftb_off
+    {0xBC14, 0xFFFE, WORD_LEN, 0},  // LL_GAMMA_FADE_TO_BLACK_START_POS
+    {0xBC16, 0xFFFF, WORD_LEN, 0},  // LL_GAMMA_FADE_TO_BLACK_END_POS
+    //aperture_preference
+    {0xBC6A, 0x04, BYTE_LEN, 0},  // LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6B, 0x00, BYTE_LEN, 0},  // LL_END_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x00, BYTE_LEN, 0},  // LL_START_APERTURE_EXP_GAIN
+    {0xBC6D, 0x00, BYTE_LEN, 0},  // LL_END_APERTURE_EXP_GAIN
+    {0xBCE2, 0x0A, BYTE_LEN, 0},  //8 //A //D   // LL_START_POS_KNEE
+    {0xBCE3, 0x30, BYTE_LEN, 0},  //14  // LL_END_POS_KNEE
+    {0xBCE4, 0x0A, BYTE_LEN, 0},  //8 //D   // LL_START_NEG_KNEE
+    {0xBCE5, 0x30, BYTE_LEN, 0},  //14  // LL_END_NEG_KNEE
+    {0x33BA, 0x001F, WORD_LEN, 0},  //84  //F1  //1F  // APEDGE_CONTROL
+    {0x33BE, 0x0000, WORD_LEN, 0},  //1   // UA_KNEE_L
+    {0x33C2, 0x4300, WORD_LEN, 0},  // UA_WEIGHTS
+    {0xBC62, 0x0E, BYTE_LEN, 0},  //6 //4   //E //8 // LL_START_APERTURE_KPGAIN
+    {0xBC63, 0x1c, BYTE_LEN, 0},  //20  //01  // LL_END_APERTURE_KPGAIN
+    {0xBC64, 0x0E, BYTE_LEN, 0},  //6 //4   //E //2 // LL_START_APERTURE_KNGAIN
+    {0xBC65, 0x1c, BYTE_LEN, 0},  //20  //01  // LL_END_APERTURE_KNGAIN
+    //gain_Max
+    {0xA81C, 0x0040, WORD_LEN, 0},  // AE_TRACK_MIN_AGAIN
+    {0xA820, 0x014C, WORD_LEN, 0},  // AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0},  // AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0},  // AE_TRACK_MAX_DGAIN
+    //min_fps
+    {0xA81A, 0x0A00, WORD_LEN, 0},  // AE_TRACK_MAX_INT_TIME_ROWS
+    {0xA818, 0x0500, WORD_LEN, 0},	//7D0	, WORD_LEN, 0},  // AE_TRACK_MAX_INT_TIME_ROWS
+    //ccm_saturation
+    {0xBC56, 0x64, BYTE_LEN, 0},  // LL_START_CCM_SATURATION
+    {0xBC57, 0x2C, BYTE_LEN, 0},  //00  // LL_END_CCM_SATURATION
+    //DCCM
+    {0xBCDE, 0x03, BYTE_LEN, 0},  // LL_START_SYS_THRESHOLD
+    {0xBCDF, 0x50, BYTE_LEN, 0},  // LL_STOP_SYS_THRESHOLD
+    {0xBCE0, 0x08, BYTE_LEN, 0},  // LL_START_SYS_GAIN
+    {0xBCE1, 0x03, BYTE_LEN, 0},  // LL_STOP_SYS_GAIN
+    //sobel
+    {0xBCD0, 0x000A, WORD_LEN, 0},  // LL_SFFB_SOBEL_FLAT_START
+    {0xBCD2, 0x00CC, WORD_LEN, 0},  //FE  // LL_SFFB_SOBEL_FLAT_STOP
+    {0xBCD4, 0x001E, WORD_LEN, 0},  // LL_SFFB_SOBEL_SHARP_START
+    {0xBCD6, 0x00FF, WORD_LEN, 0},  // LL_SFFB_SOBEL_SHARP_STOP
+    {0xBCC6, 0x00, BYTE_LEN, 0},  // LL_SFFB_SHARPENING_START
+    {0xBCC7, 0x00, BYTE_LEN, 0},  // LL_SFFB_SHARPENING_STOP
+    {0xBCC8, 0x2F, BYTE_LEN, 0},  //20  //1E  //20  // LL_SFFB_FLATNESS_START
+    {0xBCC9, 0x40, BYTE_LEN, 0},  // LL_SFFB_FLATNESS_STOP
+    {0xBCCA, 0x04, BYTE_LEN, 0},  // LL_SFFB_TRANSITION_START
+    {0xBCCB, 0x00, BYTE_LEN, 0},  // LL_SFFB_TRANSITION_STOP
+    //SFFB_slope_zero_enable
+    {0xBCE6, 0x03, BYTE_LEN, 0},  // LL_SFFB_ZERO_ENABLE
+    //manual_FD
+    {0x8417, 0x01, BYTE_LEN, 0},  // SEQ_STATE_CFG_1_FD
+    //tx_setting
+    {0xC8ED, 0x03, BYTE_LEN, 0},  // CAM_TX_ENABLE_MODE
+    //cdc_off
+    {0x098E, 0x3C02, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS
+    {0xBC02, 0x017E, WORD_LEN, 0},  // LL_ALGO
+    //[Step8-Features]
+    //AF_VCM_enable
+    {0xC400, 0x88, BYTE_LEN, 0},  // AFM_ALGO
+    {0x8419, 0x05, BYTE_LEN, 0},	//4	//, BYTE_LEN, 0},  // SEQ_STATE_CFG_1_AF
+    {0xC400, 0x08, BYTE_LEN, 0},  // AFM_ALGO
+    //AF_settings
+    {0xB002, 0x0301, WORD_LEN, 0},  // AF_MODE
+    {0xB004, 0x0002, WORD_LEN, 0},  // AF_ALGO
+    //;    {0xB045, 0x0014	//
+    //    {0xB008, 0x0003, LONG_LEN, 0}, // 0x04,   // AF_ZONE_WEIGHTS_HI
+    //    {0xB00C, 0xFFFF, LONG_LEN, 0}, // 0x04,   // AF_ZONE_WEIGHTS_LO
+    //set_posMin/Max
+    {0xC40A, 0x0028, WORD_LEN, 0},  // AFM_POS_MIN
+    {0xC40C, 0x00BE, WORD_LEN, 0},  // AFM_POS_MAX
+    {0xB018, 0x00, BYTE_LEN, 0}, 	// AF_FS_POS_0
+    {0xB019, 0x1E, BYTE_LEN, 0}, 	// AF_FS_POS_1
+    {0xB01A, 0x2D, BYTE_LEN, 0}, 	// AF_FS_POS_2
+    {0xB01B, 0x3C, BYTE_LEN, 0}, 	// AF_FS_POS_3
+    {0xB01C, 0x4B, BYTE_LEN, 0}, 	// AF_FS_POS_4
+    {0xB01D, 0x5A, BYTE_LEN, 0}, 	// AF_FS_POS_5
+    {0xB01E, 0x69, BYTE_LEN, 0}, 	// AF_FS_POS_6
+    {0xB01F, 0x78, BYTE_LEN, 0}, 	// AF_FS_POS_7
+    {0xB020, 0x87, BYTE_LEN, 0}, 	// AF_FS_POS_8
+    {0xB021, 0x96, BYTE_LEN, 0}, 	// AF_FS_POS_9
+    {0xB022, 0xA5, BYTE_LEN, 0}, 	// AF_FS_POS_10
+    {0xB023, 0xB4, BYTE_LEN, 0}, 	// AF_FS_POS_11
+    {0xB024, 0xC3, BYTE_LEN, 0}, 	// AF_FS_POS_12
+    {0xB012, 0x0D, BYTE_LEN, 0}, 	// AF_FS_NUM_STEPS [13step]																 //AF_postition_settings
+    {0xB014, 0x0B, BYTE_LEN, 0},  // AF_FS_STEP_SIZE
+    //{0x8404, 0x05, BYTE_LEN, 100},//200},  // SEQ_CMD reflash
+    {0x8404, 0x06, BYTE_LEN, 100},//200}, //150},  // SEQ_CMD reflash mode //1000
+
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_mipi_start[] =
+{
+    {0x301A, 0x107C, WORD_LEN, 0},	// RESET_REGISTER
+    {0x3400, 0x7A26, WORD_LEN, 0},	// MIPI_CONTROL
+    {0x001A, 0x0018, WORD_LEN, 0},	// RESET_AND_MISC_CONTROL
+    {0x001A, 0x001C, WORD_LEN, 0},	// RESET_AND_MISC_CONTROL
+    {0x3CA0, 0x0001, WORD_LEN, 0},	// TXSS_PARAMETERS
+    //{0x098E, 0x48D4, WORD_LEN, 0},	// LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_MIPICHANNEL]
+    {0xC8D4, 0x0000, WORD_LEN, 0},	// CAM_OUTPUT_1_MIPICHANNEL
+    {0x3CA2, 0x0087, WORD_LEN, 0},	// TXC_PARAMETERS
+    {0x3402, 0x0011, WORD_LEN, 0},	// MIPI_STATUS
+    {0x3400, 0x7A24, WORD_LEN, 0},	// MIPI_CONTROL
+};
+
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_trigger[] =
+{
+    //[AF_trigger]
+    {0x098E, 0xB006, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AF_PROGRESS]
+    {0xB006, 0x01, BYTE_LEN, 0}, 	// AF_PROGRESS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_preview[] =
+{
+    //[Preview]
+    {0x3EDA, 0x6060, WORD_LEN, 0},	// DAC_LD_14_15
+    {0x098E, 0x843C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+    {0x843C, 0x01, BYTE_LEN, 0}, 	// SEQ_STATE_CFG_5_MAX_FRAME_CNT
+    {0x8404, 0x01, BYTE_LEN, 100}, 	// SEQ_CMD
+    {0x3170, 0x2096, WORD_LEN, 0},	// ANALOG_CONTROL
+    //{0x0016, 0x0447, WORD_LEN, 0},  // CLOCKS_CONTROL
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_capture[] =
+{
+    {0x3EDA, 0x6060, WORD_LEN, 0},	// DAC_LD_14_15
+    {0x098E, 0x843C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+    {0x843C, 0xFF, BYTE_LEN, 0}, 	// SEQ_STATE_CFG_5_MAX_FRAME_CNT
+    {0x8404, 0x02, BYTE_LEN, 100}, 	// SEQ_CMD
+    {0x3170, 0x205C, WORD_LEN, 0},	// ANALOG_CONTROL
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_reflect_none[] =
+{
+    {0x098E, 0xC850, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+    {0xC850, 0x00, BYTE_LEN, 0}, // CAM_CORE_A_ORIENTATION
+    {0xC888, 0x00, BYTE_LEN, 0}, // CAM_CORE_B_ORIENTATION
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_reflect_mirror[] =
+{
+    {0x098E, 0xC850, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+    {0xC850, 0x01, BYTE_LEN, 0}, // CAM_CORE_A_ORIENTATION
+    {0xC888, 0x01, BYTE_LEN, 0}, // CAM_CORE_B_ORIENTATION
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_reflect_flip[] =
+{
+    {0x098E, 0xC850, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+    {0xC850, 0x02, BYTE_LEN, 0}, // CAM_CORE_A_ORIENTATION
+    {0xC888, 0x02, BYTE_LEN, 0}, // CAM_CORE_B_ORIENTATION
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_reflect_mirror_flip[] =
+{
+    {0xC850, 0x03, BYTE_LEN, 0}, // CAM_CORE_A_ORIENTATION
+    {0xC888, 0x03, BYTE_LEN, 0}, // CAM_CORE_B_ORIENTATION
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ficker_fps_variable[] =
+{
+    {0x098E, 0x485C, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_MIN_FRAME_LENGTH_LINES]
+    {0xC85C, 0x0590, WORD_LEN, 0}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+    {0x098E, 0x2818, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_TARGET_INT_TIME_ROWS]
+    {0xA818, 0x0500, WORD_LEN, 0}, // AE_TRACK_TARGET_INT_TIME_ROWS
+    {0xA81A, 0x0B80, WORD_LEN, 0}, // AE_TRACK_MAX_INT_TIME_ROWS
+    {0x098E, 0x8404, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ficker_fps_8[] =
+{
+    {0x098E, 0x485C, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_MIN_FRAME_LENGTH_LINES]
+    {0xC85C, 0x0A00, WORD_LEN, 0}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+    //    {0x098E, 0x2816, BYTE_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_INT_TIME_ROWS]
+    {0xA818, 0x0A00, WORD_LEN, 0}, // AE_TRACK_TARGET_INT_TIME_ROWS
+    {0xA81A, 0x0A00, WORD_LEN, 0}, // AE_TRACK_MAX_INT_TIME_ROWS
+    {0x098E, 0x8404, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ficker_fps_10[] =
+{
+    {0x098E, 0x485C, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_MIN_FRAME_LENGTH_LINES]
+    {0xC85C, 0x07FC, WORD_LEN, 0}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+    //    {0x098E, 0x2816, BYTE_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_INT_TIME_ROWS]
+    {0xA818, 0x0890, WORD_LEN, 0}, // AE_TRACK_TARGET_INT_TIME_ROWS
+    {0xA81A, 0x0890, WORD_LEN, 0},	// AE_TRACK_MAX_INT_TIME_ROWS
+    {0x098E, 0x8404, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ficker_fps_15[] =
+{
+    {0x098E, 0x485C, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_MIN_FRAME_LENGTH_LINES]
+    {0xC85C, 0x02A8, WORD_LEN, 0}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+    {0x098E, 0x2816, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_INT_TIME_ROWS]
+    {0xA818, 0x0300, WORD_LEN, 0}, // AE_TRACK_TARGET_INT_TIME_ROWS
+    {0xA81A, 0x0300, WORD_LEN, 0},	// AE_TRACK_MAX_INT_TIME_ROWS
+    {0x098E, 0x8404, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_autobanding_auto_fd[] =
+{
+    {0x098E, 0x8417, WORD_LEN, 0},        // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_FD]
+    {0x8417, 0x02, BYTE_LEN, 0},          // SEQ_STATE_CFG_1_FD
+    {0xA004, 0x3C, BYTE_LEN, 0},         // FD_EXPECTED_FLICKER_SOURCE_FREQUENCY
+    {0xA002, 0x0001, WORD_LEN, 0},        // FD_ALGO
+    {0x8404, 0x06, BYTE_LEN, 0}, 			// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_autobanding_manual_fd_60[] =
+{
+    {0x098E, 0x8417, WORD_LEN, 0},       // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_FD]
+    {0x8417, 0x01, BYTE_LEN, 0},         // SEQ_STATE_CFG_1_FD
+    {0xA004, 0x3C, BYTE_LEN, 0},         // FD_EXPECTED_FLICKER_SOURCE_FREQUENCY
+    {0xA002, 0x0003, WORD_LEN, 0},       // FD_ALGO
+    {0x8404, 0x06, BYTE_LEN, 0}, 			// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_autobanding_manual_fd_50[] =
+{
+    {0x098E, 0x8417, WORD_LEN, 0},        // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_FD]
+    {0x8417, 0x01, BYTE_LEN, 0},          // SEQ_STATE_CFG_1_FD
+    {0xA004, 0x32, BYTE_LEN, 0},         // FD_EXPECTED_FLICKER_SOURCE_FREQUENCY
+    {0xA002, 0x0003, WORD_LEN, 0},        // FD_ALGO
+    {0x8404, 0x06, BYTE_LEN, 0}, 			// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_autobanding_fd_off[] =
+{
+    {0x098E, 0x8417, WORD_LEN, 0},       // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_FD]
+    {0x8417, 0x00, BYTE_LEN, 0},         // SEQ_STATE_CFG_1_FD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_auto[] =
+{
+    //[1. Auto]
+    {0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x50, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x13, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xACB2, 0x3A, BYTE_LEN, 0}, 	// AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x41, BYTE_LEN, 0}, 	// AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x47, BYTE_LEN, 0}, 	// AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4E, BYTE_LEN, 0}, 	// AWB_BG_MAX_BRIGHT               
+    {0xAC44, 0x00, BYTE_LEN, 0}, 	// AWB_LEFT_CCM_POS_RANGE_LIMIT                                 
+    {0xAC45, 0x7F, BYTE_LEN, 0}, 	// AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_sunny[] =
+{
+    //[5. Daylight]
+    { 0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x38, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x42, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x44, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x4C, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xACB2, 0x38, BYTE_LEN, 0}, 	// AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x42, BYTE_LEN, 0}, 	// AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x44, BYTE_LEN, 0}, 	// AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4C, BYTE_LEN, 0}, 	// AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x7C, BYTE_LEN, 0}, 	// AWB_LEFT_CCM_POS_RANGE_LIMIT                                 
+    {0xAC45, 0x7F, BYTE_LEN, 0}, 	// AWB_RIGHT_CCM_POS_RANGE_LIMIT                                
+    {0xAC04, 0x3E, BYTE_LEN, 0}, 	// AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0}, 	// AWB_PRE_AWB_B2G_RATIO
+    {0xAC08, 0x7F, BYTE_LEN, 0}, 	// AWB_CUR_CCM_POS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_cloudy[] =
+{
+    //[4. Cloudy]
+    { 0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x3A, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x44, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x40, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x4A, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xACB2, 0x3A, BYTE_LEN, 0}, 	// AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x44, BYTE_LEN, 0}, 	// AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x40, BYTE_LEN, 0}, 	// AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4A, BYTE_LEN, 0}, 	// AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x7C, BYTE_LEN, 0}, 	// AWB_LEFT_CCM_POS_RANGE_LIMIT                                 
+    {0xAC45, 0x7F, BYTE_LEN, 0}, 	// AWB_RIGHT_CCM_POS_RANGE_LIMIT                                
+    {0xAC04, 0x40, BYTE_LEN, 0}, 	// AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0}, 	// AWB_PRE_AWB_B2G_RATIO
+    {0xAC08, 0x7F, BYTE_LEN, 0}, 	// AWB_CUR_CCM_POS
+
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_office[] =
+{
+    //[3. Fluorescent]
+    { 0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x44, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x4B, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x2C, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x34, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xACB2, 0x44, BYTE_LEN, 0}, 	// AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0}, 	// AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x2C, BYTE_LEN, 0}, 	// AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x34, BYTE_LEN, 0}, 	// AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x40, BYTE_LEN, 0}, 	// AWB_LEFT_CCM_POS_RANGE_LIMIT                                 
+    {0xAC45, 0x4A, BYTE_LEN, 0}, 	// AWB_RIGHT_CCM_POS_RANGE_LIMIT                                
+    {0xAC04, 0x47, BYTE_LEN, 0}, 	// AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x30, BYTE_LEN, 0}, 	// AWB_PRE_AWB_B2G_RATIO
+    {0xAC08, 0x45, BYTE_LEN, 0}, 	// AWB_CUR_CCM_POS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_home[] =
+{
+    //[2. Incandescent]
+    { 0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x57, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x5F, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x26, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x2E, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xACB2, 0x57, BYTE_LEN, 0}, 	// AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x5F, BYTE_LEN, 0}, 	// AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x26, BYTE_LEN, 0}, 	// AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x2E, BYTE_LEN, 0}, 	// AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0}, 	// AWB_LEFT_CCM_POS_RANGE_LIMIT                                 
+    {0xAC45, 0x08, BYTE_LEN, 0}, 	// AWB_RIGHT_CCM_POS_RANGE_LIMIT                                
+    {0xAC04, 0x5B, BYTE_LEN, 0}, 	// AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x2A, BYTE_LEN, 0}, 	// AWB_PRE_AWB_B2G_RATIO
+    {0xAC08, 0x00, BYTE_LEN, 0}, 	// AWB_CUR_CCM_POS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_wb_flash_led[] =
+{
+    //[6. Flash LED]
+    { 0x098E, 0xACB0, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x38, BYTE_LEN, 0}, 	// AWB_RG_MIN
+    {0xACB1, 0x42, BYTE_LEN, 0}, 	// AWB_RG_MAX
+    {0xACB4, 0x44, BYTE_LEN, 0}, 	// AWB_BG_MIN
+    {0xACB5, 0x4C, BYTE_LEN, 0}, 	// AWB_BG_MAX
+    {0xAC04, 0x3E, BYTE_LEN, 0}, 	// AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0}, 	// AWB_PRE_AWB_B2G_RATIO
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_auto[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x06, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x14, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x31, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x53, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6E, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x84, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x98, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA7, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB5, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC1, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xCB, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD5, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDD, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE5, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEC, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF3, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0B80, WORD_LEN, 0},	// 5 fps
+    // EV
+    {0xA409, 0x48, BYTE_LEN, 0}, // AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0}, // STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0}, // AWB_RG_MIN
+    {0xACB1, 0x50, BYTE_LEN, 0}, // AWB_RG_MAX
+    {0xACB4, 0x13, BYTE_LEN, 0}, // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0}, // AWB_BG_MAX
+    {0xACB2, 0x3A, BYTE_LEN, 0}, // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x41, BYTE_LEN, 0}, // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x47, BYTE_LEN, 0}, // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4E, BYTE_LEN, 0}, // AWB_BG_MAX_BRIGHT 
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+// Shapness
+    {0xBC6A, 0x05, BYTE_LEN, 0}, // LL_START_APERTURE_INTEGER_GAIN
+// Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_portrait[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x27, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x36, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x49, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x64, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x78, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x89, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA4, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xCE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xD7, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xE8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0FF4, WORD_LEN, 0},	// 5 fps
+    // EV
+    {0xA409, 0x44, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0x07, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x04, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_landscape[] =
+{
+
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x05, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x11, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4D, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9C, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBC, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0640, WORD_LEN, 0},      //15 fps
+    // EV
+    {0xA409, 0x44, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x40, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x40, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x78, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    {0xAC04, 0x40, BYTE_LEN, 0},	 	 // AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0},		 // AWB_PRE_AWB_B2G_RATIO
+    // Shapness
+    {0xBC6A, 0x05, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_night[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x27, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x36, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x49, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x64, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x78, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x89, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA4, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xCE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xD7, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xE8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x1160, WORD_LEN, 0},      //5 fps
+    // EV
+    {0xA409, 0x34, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x02, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_beach_snow[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x05, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x11, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4D, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9C, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBC, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0640, WORD_LEN, 0},      //15 fps
+    // EV
+    {0xA409, 0x68, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x40, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x40, BYTE_LEN, 0},   // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x78, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    {0xAC04, 0x40, BYTE_LEN, 0},	 	 // AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0},		 // AWB_PRE_AWB_B2G_RATIO
+    // Shapness  
+    {0xBC6A, 0x05, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_dawn[] =
+{
+
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x05, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x11, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4D, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9C, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBC, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0FF4, WORD_LEN, 0},      //5 fps
+    // EV
+    {0xA409, 0x34, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0x07, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0xACB0, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x40, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x38, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x44, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x40, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x4C, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x78, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    {0xAC04, 0x40, BYTE_LEN, 0},	 	 // AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x48, BYTE_LEN, 0},		 // AWB_PRE_AWB_B2G_RATIO
+    // Shapness
+    {0xBC6A, 0x05, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_sun_down[] =
+{
+
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x05, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x11, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4D, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6A, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9C, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBC, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF5, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0FF4, WORD_LEN, 0},      //5 fps
+    // EV
+    {0xA409, 0x34, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0x07, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0xACB0, 0x31, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x05, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_candlelight[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x08, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x19, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x36, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x57, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x70, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x85, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA6, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x1160, WORD_LEN, 0},      //5 fps
+    // EV
+    {0xA409, 0x28, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0x07, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0xACB0, 0x57, BYTE_LEN, 0},   // AWB_RG_MIN
+    {0xACB1, 0x5F, BYTE_LEN, 0},   // AWB_RG_MAX
+    {0xACB4, 0x26, BYTE_LEN, 0},   // AWB_BG_MIN
+    {0xACB5, 0x2E, BYTE_LEN, 0},   // AWB_BG_MAX
+    {0xACB2, 0x57, BYTE_LEN, 0},   // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x5F, BYTE_LEN, 0},   // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x26, BYTE_LEN, 0},   // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x2E, BYTE_LEN, 0},   // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},   // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x08, BYTE_LEN, 0},   // AWB_RIGHT_CCM_POS_RANGE_LIMIT 							   
+    {0xAC04, 0x5B, BYTE_LEN, 0},   // AWB_PRE_AWB_R2G_RATIO
+    {0xAC05, 0x2A, BYTE_LEN, 0},   // AWB_PRE_AWB_B2G_RATIO
+    {0xAC08, 0x00, BYTE_LEN, 0},   // AWB_CUR_CCM_POS 
+    // Shapness
+    {0xBC6A, 0x02, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_sports[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x08, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x19, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x36, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x57, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x70, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x85, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA6, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x04B0, WORD_LEN, 0},      //20 fps
+    // EV
+    {0xA409, 0x44, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0},      //AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},      // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},      // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},      // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},      // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},      // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},      //AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},      //AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},      //AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},      // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x06, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_text[] =
+{
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x03, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x09, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x1B, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x3F, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x60, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x82, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9F, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xB4, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xC3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xD0, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xDA, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xE2, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE8, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xEE, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF3, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF7, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFB, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},      //LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0FF4, WORD_LEN, 0},      //5 fps
+    // EV
+    {0xA409, 0x44, BYTE_LEN, 0},      //AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0xFF, BYTE_LEN, 0},      //STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT								   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x07, BYTE_LEN, 0},      //LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},      //SEQ_CMD
+
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_scene_backlight[] =
+{
+    //[10.SM - Backlight]
+    // Contrast
+    {0xBC2B, 0x00, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x08, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x19, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x36, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x57, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x70, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x85, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA6, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB3, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBE, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC9, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD3, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDB, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE3, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEB, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF2, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0},   // LL_GAMMA_NEUTRAL_CURVE_18
+    // FPS
+    {0xA81A, 0x0FF4, WORD_LEN, 0}, // 5 fps
+    // EV
+    {0xA409, 0x44, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    // AE Mode
+    {0xB826, 0x07, BYTE_LEN, 0},   // STAT_AE_ZONE_WEIGHTS
+    // WB Mode
+    {0x098E, 0xACB0, WORD_LEN, 0},  // LOGICAL_ADDRESS_ACCESS [AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO]
+    {0xACB0, 0x31, BYTE_LEN, 0},    // AWB_RG_MIN
+    {0xACB1, 0x5B, BYTE_LEN, 0},    // AWB_RG_MAX
+    {0xACB4, 0x2A, BYTE_LEN, 0},    // AWB_BG_MIN
+    {0xACB5, 0x5B, BYTE_LEN, 0},    // AWB_BG_MAX
+    {0xACB2, 0x3C, BYTE_LEN, 0},    // AWB_RG_MIN_BRIGHT
+    {0xACB3, 0x4B, BYTE_LEN, 0},    // AWB_RG_MAX_BRIGHT
+    {0xACB6, 0x36, BYTE_LEN, 0},    // AWB_BG_MIN_BRIGHT
+    {0xACB7, 0x42, BYTE_LEN, 0},    // AWB_BG_MAX_BRIGHT
+    {0xAC44, 0x00, BYTE_LEN, 0},    // AWB_LEFT_CCM_POS_RANGE_LIMIT                                                   
+    {0xAC45, 0x7F, BYTE_LEN, 0},    // AWB_RIGHT_CCM_POS_RANGE_LIMIT  
+    // Shapness
+    {0xBC6A, 0x05, BYTE_LEN, 0},   // LL_START_APERTURE_INTEGER_GAIN
+    // Refresh Mode
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_3[] =
+{
+	//[EV 3]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x78, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x0A, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_2[] =
+{
+	//[EV 2]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x68, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x0A, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_1[] =
+{
+	//[EV 1]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x58, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x08, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_0[] =
+{
+	//[EV 0]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x48, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x0A, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_n1[] =
+{
+	//[EV -1]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x38, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x06, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_n2[] =
+{
+	//[EV -2]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x28, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x06, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_ev_n3[] =
+{
+	//[EV -3]
+    {0x098E, 0xA409, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_BASE_TARGET]
+    {0xA409, 0x18, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0xA805, 0x06, BYTE_LEN, 0},   // AE_TRACK_GATE
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_800[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81E, 0x015E, WORD_LEN, 0},	// AE_TRACK_TARGET_AGAIN
+    {0xA81C, 0x012E, WORD_LEN, 0}, 	// AE_TRACK_MIN_AGAIN
+    {0xA820, 0x015E, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x0120, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_400[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81E, 0x015E, WORD_LEN, 0}, 	// AE_TRACK_TARGET_AGAIN
+    {0xA81C, 0x0120, WORD_LEN, 0}, 	// AE_TRACK_MIN_AGAIN
+    {0xA820, 0x015E, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_200[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81C, 0x0090, WORD_LEN, 0}, 	// AE_TRACK_MIN_AGAIN
+    {0xA81E, 0x00B0, WORD_LEN, 0}, 	// AE_TRACK_TARGET_AGAIN
+    {0xA820, 0x00D0, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_100[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81C, 0x0046, WORD_LEN, 0}, 	// AE_TRACK_MIN_AGAIN
+    {0xA81E, 0x0056, WORD_LEN, 0}, 	// AE_TRACK_TARGET_AGAIN
+    {0xA820, 0x0066, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_50[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81C, 0x0029, WORD_LEN, 0}, 	// AE_TRACK_MIN_AGAIN
+    {0xA81E, 0x0029, WORD_LEN, 0}, 	// AE_TRACK_TARGET_AGAIN
+    {0xA820, 0x0049, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_iso_auto[] =
+{
+    {0x098E, 0xA81C, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+    {0xA81C, 0x0040, WORD_LEN, 0},	// AE_TRACK_MIN_AGAIN
+    {0xA81E, 0x012C, WORD_LEN, 0}, 	// AE_TRACK_TARGET_AGAIN
+    {0xA820, 0x014C, WORD_LEN, 0}, 	// AE_TRACK_MAX_AGAIN
+    {0xA822, 0x0080, WORD_LEN, 0}, 	// AE_TRACK_MIN_DGAIN
+    {0xA824, 0x00A0, WORD_LEN, 0}, 	// AE_TRACK_MAX_DGAIN
+    {0x8404, 0x06, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_8[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x07, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x14, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x29, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4A, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6A, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x89, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0xA2, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xB5, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xC4, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xCF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xE1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xED, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF2, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_7[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x07, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x15, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2B, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4C, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6B, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x89, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0xA1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xB3, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xC2, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xCD, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xEC, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_6[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x07, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x16, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x2D, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x4E, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6C, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x88, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9F, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xB1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xCB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD5, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xDD, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE4, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xEB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xF1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_5[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x08, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x19, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x31, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x52, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6E, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x87, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9C, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAD, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xBB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xD1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xE1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE8, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF5, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_4[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x09, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x1A, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x34, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x54, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x6F, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x87, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x9B, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xAB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB8, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC4, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xCE, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEE, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF4, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xFA, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_3[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x0A, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x1C, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x36, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x56, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x70, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x99, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xC1, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xCC, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD5, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDE, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE5, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEC, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF3, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_2[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x0A, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x1E, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x39, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x59, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x71, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x86, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x97, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA6, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xB3, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xBF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xD3, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xDB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xE4, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xEB, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF2, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_1[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS[LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x04, BYTE_LEN, 0}, 	// LL_GAMMA_CURVE_SELECTOR
+
+    {0x098E, 0xBC2B, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS[LL_GAMMA_NEUTRAL_CURVE_0]
+    {0xBC2B, 0x00, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+    {0xBC2C, 0x0C, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+    {0xBC2D, 0x22, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+    {0xBC2E, 0x3E, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+    {0xBC2F, 0x5D, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+    {0xBC30, 0x73, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+    {0xBC31, 0x85, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+    {0xBC32, 0x94, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+    {0xBC33, 0xA2, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+    {0xBC34, 0xAE, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+    {0xBC35, 0xB9, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+    {0xBC36, 0xC3, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+    {0xBC37, 0xCD, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+    {0xBC38, 0xD7, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+    {0xBC39, 0xDF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+    {0xBC3A, 0xE8, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+    {0xBC3B, 0xF0, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+    {0xBC3C, 0xF8, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+    {0xBC3D, 0xFF, BYTE_LEN, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+    {0x8404, 0x05, BYTE_LEN, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_contrast_0[] =
+{
+    {0x098E, 0xBC51, WORD_LEN, 0},	// LOGICAL_ADDRESS_ACCESS[LL_GAMMA_CURVE_SELECTOR]
+    {0xBC51, 0x01, BYTE_LEN, 0},	// LL_GAMMA_CURVE_SELECTOR
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_5[] =
+{
+    //[10. Satu +5]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0xC8, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_4[] =
+{
+    //[9. Satu +4]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0xB4, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_3[] =
+{
+    //[8. Satu +3]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0xA0, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_2[] =
+{
+    //[7. Satu +2]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x8C, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_1[] =
+{
+    //[6. Satu +1]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x78, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_0[] =
+{
+    //[5. Satu 0]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x64, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_n1[] =
+{
+    //[4. Satu -1]
+    {0x098E, 0xBC56, WORD_LEN, 0},	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x50, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_n2[] =
+{
+    //[3. Satu -2]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x3C, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_n3[] =
+{
+    //[2. Satu -3]
+    {0x098E, 0xBC56, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x28, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATION
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_n4[] =
+{
+    //[1. Satu -4]
+    {0x098E, 0xBC56, WORD_LEN, 0},  	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x14, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATIO
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_saturation_n5[] =
+{
+   //[0. Satu -5]
+    {0x098E, 0xBC56, WORD_LEN, 0},  	// LOGICAL_ADDRESS_ACCESS [LL_START_CCM_SATURATION]
+    {0xBC56, 0x01, BYTE_LEN, 0}, 	// LL_START_CCM_SATURATIO
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_6[] =
+{
+    //[6. Sharp 6]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x07, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_5[] =
+{
+    //[5. Sharp 5]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x05, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_4[] =
+{
+    //[4. Sharp 4]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_3[] =
+{
+
+    //[3. Sharp 3]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x03, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_2[] =
+{
+    //[2. Sharp 2]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x02, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_1[] =
+{
+    //[1. Sharp 1]
+    {0x098E, 0xBC6A, WORD_LEN, 0}, 	// LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x01, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_sharpness_default[] =
+{
+    //[0. Sharp Default]
+    {0x098E, 0xBC6A, WORD_LEN, 0},  	//LOGICAL_ADDRESS_ACCESS [LL_START_APERTURE_INTEGER_GAIN]
+    {0xBC6A, 0x04, BYTE_LEN, 0},        //LL_START_APERTURE_INTEGER_GAIN
+    {0xBC6C, 0x00, BYTE_LEN, 0}, 	// LL_START_APERTURE_EXP_GAIN
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_exposure_average[] =
+{
+    {0x098E, 0xB820, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0xB820, 0x14, BYTE_LEN, 0}, // RESERVED_STAT_20
+    {0xB821, 0x14, BYTE_LEN, 0}, // RESERVED_STAT_21
+    {0xB822, 0xD2, BYTE_LEN, 0}, // RESERVED_STAT_22
+    {0xB823, 0xD2, BYTE_LEN, 0}, // RESERVED_STAT_23
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+struct mt9p111_i2c_reg_conf mt9p111_reg_exposure_spot[] =
+{
+    {0x098E, 0xB820, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0xB820, 0x66, BYTE_LEN, 0}, // RESERVED_STAT_20
+    {0xB821, 0x66, BYTE_LEN, 0}, // RESERVED_STAT_21
+    {0xB822, 0x33, BYTE_LEN, 0}, // RESERVED_STAT_22
+    {0xB823, 0x33, BYTE_LEN, 0}, // RESERVED_STAT_23
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_exposure_center[] =
+{
+    {0x098E, 0xB820, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS
+    {0xB820, 0x26, BYTE_LEN, 0}, // RESERVED_STAT_20
+    {0xB821, 0x26, BYTE_LEN, 0}, // RESERVED_STAT_21
+    {0xB822, 0xB5, BYTE_LEN, 0}, // RESERVED_STAT_22
+    {0xB823, 0xB5, BYTE_LEN, 0}, // RESERVED_STAT_23
+    {0x8404, 0x06, BYTE_LEN, 0}, // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_rect_spot[] =
+{
+    {0x098E, 0xB854, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+    {0xB854, 0x66, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_X
+    {0xB855, 0x66, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_Y
+    {0xB856, 0x33, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_X
+    {0xB857, 0x33, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_Y
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_rect_center[] =
+{
+    {0x098E, 0xB854, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+    {0xB854, 0x20, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_X
+    {0xB855, 0x20, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_Y
+    {0xB856, 0xBF, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_X
+    {0xB857, 0xBF, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_Y
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_rect_average[] =
+{
+    {0x098E, 0xB854, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+    {0xB854, 0x00, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_X
+    {0xB855, 0x00, BYTE_LEN, 0}, // STAT_SM_WINDOW_POS_Y
+    {0xB856, 0xFF, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_X
+    {0xB857, 0xFF, BYTE_LEN, 0}, // STAT_SM_WINDOW_SIZE_Y
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_micro[] =
+{
+    {0x098E, 0x8419, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+    {0x8419, 0x01, BYTE_LEN, 0},   // SEQ_STATE_CFG_1_AF
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+    {0x098E, 0xB007, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+    {0xB007, 0xFF, BYTE_LEN, 0},   // AF_BEST_LENS_POS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_infinity[] =
+{
+    {0x098E, 0x8419, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+    {0x8419, 0x01, BYTE_LEN, 0},   // SEQ_STATE_CFG_1_AF
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+    {0x098E, 0xB007, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+    {0xB007, 0x00, BYTE_LEN, 0},   // AF_BEST_LENS_POS
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_scan[] =
+{
+    {0x098E, 0x8419, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+    {0x8419, 0x05, BYTE_LEN, 0},   // SEQ_STATE_CFG_1_AF
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_continuous[] =
+{
+    {0x098E, 0x8419, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+    {0x8419, 0x03, BYTE_LEN, 0},   // SEQ_STATE_CFG_1_AF
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_af_off[] =
+{
+	{0x098E, 0x8419, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+    {0x8419, 0x00, BYTE_LEN, 0},   // SEQ_STATE_CFG_1_AF
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_brightness_4[] =
+{
+	/* Brightness +2: */
+    {0x337E, 0x2000, WORD_LEN, 0}, // Y_RGB_OFFSET
+    {0x098E, 0xA401, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_MODE]
+    {0xA401, 0x00, BYTE_LEN, 0},   // AE_RULE_MODE
+    {0xA409, 0x3F, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_brightness_3[] =
+{
+	/* Brightness +1: */
+    {0x337E, 0x1000, WORD_LEN, 0}, // Y_RGB_OFFSET
+    {0x098E, 0xA401, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_MODE]
+    {0xA401, 0x00, BYTE_LEN, 0},   // AE_RULE_MODE
+    {0xA409, 0x3F, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_brightness_2[] =
+{
+	/* Brightness 0: */
+    {0x337E, 0x0000, WORD_LEN, 0}, // Y_RGB_OFFSET
+    {0x098E, 0xA401, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_MODE]
+    {0xA401, 0x00, BYTE_LEN, 0},   // AE_RULE_MODE
+    {0xA409, 0x3F, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_brightness_1[] =
+{
+	/* Brightness -1: */
+    {0x098E, 0xA401, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_MODE]
+    {0xA401, 0x00, BYTE_LEN, 0},   // AE_RULE_MODE
+    {0xA409, 0x28, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_brightness_0[] =
+{
+	/* Brightness -2: */
+	{0x098E, 0xA401, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [AE_RULE_MODE]
+    {0xA401, 0x00, BYTE_LEN, 0},   // AE_RULE_MODE
+    {0xA409, 0x1E, BYTE_LEN, 0},   // AE_RULE_BASE_TARGET
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_effect_normal[] =
+{
+	/* normal: */
+    {0x098E, 0xDC38, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+    {0xDC38, 0x00, BYTE_LEN, 0},   // SYS_SELECT_FX
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_effect_mono[] =
+{
+	/* B&W: */
+    {0x098E, 0xDC38, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+    {0xDC38, 0x01, BYTE_LEN, 0},   // SYS_SELECT_FX
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_effect_sepia[] =
+{
+	/* Sepia(antique): */
+    {0x098E, 0xDC38, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+    {0xDC38, 0x02, BYTE_LEN, 0},   // SYS_SELECT_FX
+    //{0xDC3A, 0x2A, BYTE_LEN, 0},   // SYS_SEPIA_CR
+    //{0xDC3B, 0xC8, BYTE_LEN, 0},   // SYS_SEPIA_CB
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+struct mt9p111_i2c_reg_conf mt9p111_reg_effect_negative[] =
+{
+	/* Negative: */
+    {0x098E, 0xDC38, WORD_LEN, 0}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+    {0xDC38, 0x03, BYTE_LEN, 0},   // SYS_SELECT_FX
+    {0x8404, 0x06, BYTE_LEN, 0},   // SEQ_CMD
+};
+
+
+/*=============================================================
+general function
+=============================================================*/
+static int mt9p111_i2c_rxdata(unsigned short saddr, unsigned char *rxdata,
+			int length)
+{
+	struct i2c_msg msgs[] = {
+		{
+			.addr = saddr,
+			.flags = 0,
+			.len = 2,
+			.buf = rxdata,
+		},
+		{
+			.addr = saddr,
+			.flags = I2C_M_RD,
+			.len = length,
+			.buf = rxdata,
+		},
+	};
+
+	if (i2c_transfer(mt9p111_client->adapter, msgs, 2) < 0) {
+		printk(KERN_ERR "mt9p111_i2c_rxdata failed!\n");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int32_t mt9p111_i2c_read(unsigned short   saddr,
+	unsigned short raddr, unsigned short *rdata, enum mt9p111_width width)
+{
+	int32_t rc = 0;
+	unsigned char buf[4];
+
+	if (!rdata)
+		return -EIO;
+
+	memset(buf, 0, sizeof(buf));
+
+	switch (width) {
+	case WORD_LEN: {
+		buf[0] = (raddr & 0xFF00)>>8;
+		buf[1] = (raddr & 0x00FF);
+
+		rc = mt9p111_i2c_rxdata(saddr, buf, 2);
+		if (rc < 0)
+			return rc;
+    
+		*rdata = buf[0] << 8 | buf[1];
+        //printk("word 0x%x  0x%x\n", raddr,*rdata);
+	}
+		break;
+
+
+    case BYTE_LEN: {
+		buf[0] = (raddr & 0xFF00)>>8;
+		buf[1] = (raddr & 0x00FF);
+
+		rc = mt9p111_i2c_rxdata(saddr, buf, 1);
+		if (rc < 0)
+			return rc;
+   
+		*rdata = buf[0];// << 8 | buf[1];
+	}
+		break;
+
+	default:
+		break;
+	}
+
+	if (rc < 0)
+		printk(KERN_ERR "mt9p111_i2c_read failed!\n");
+
+	return rc;
+}
+
+static int32_t mt9p111_i2c_txdata(unsigned short saddr,
+				  unsigned char *txdata,
+				  int length)
+{
+	struct i2c_msg msg[] = {
+		{
+		 .addr = saddr,
+		 .flags = 0,
+		 .len = length,
+		 .buf = txdata,
+		 },
+	};
+
+	if (i2c_transfer(mt9p111_client->adapter, msg, 1) < 0) {
+		printk(KERN_ERR "mt9p111_i2c_txdata failed\n");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int32_t mt9p111_i2c_write(unsigned short saddr,
+	unsigned short waddr, unsigned short wdata, enum mt9p111_width width)
+{
+	int32_t rc = -EIO;
+	unsigned char buf[4];
+
+	memset(buf, 0, sizeof(buf));
+	switch (width) {
+	case WORD_LEN: {
+		buf[0] = (waddr & 0xFF00)>>8;
+		buf[1] = (waddr & 0x00FF);
+		buf[2] = (wdata & 0xFF00)>>8;
+		buf[3] = (wdata & 0x00FF);
+
+		rc = mt9p111_i2c_txdata(saddr, buf, 4);
+	}
+		break;
+
+	case BYTE_LEN: {
+		buf[0] = (waddr & 0xFF00)>>8;
+		buf[1] = (waddr & 0x00FF);
+		buf[2] = (wdata & 0x00FF);
+		rc = mt9p111_i2c_txdata(saddr, buf, 3);
+	}
+		break;
+
+	default:
+		break;
+	}
+
+	if (rc < 0)
+		printk(KERN_ERR 
+		"i2c_write failed, addr = 0x%x, val = 0x%x!\n",
+		waddr, wdata);
+
+	return rc;
+}
+
+static int32_t mt9p111_i2c_write_table(
+	struct mt9p111_i2c_reg_conf const *reg_conf_tbl,
+	int num_of_items_in_table)
+{
+	int i;
+	int32_t rc = -EIO;
+
+	for (i = 0; i < num_of_items_in_table; i++) {
+		rc = mt9p111_i2c_write(mt9p111_client->addr,
+			reg_conf_tbl->waddr, reg_conf_tbl->wdata,
+			reg_conf_tbl->width);
+		if (rc < 0)
+			break;
+		if (reg_conf_tbl->mdelay_time != 0)
+			msleep(reg_conf_tbl->mdelay_time);
+		reg_conf_tbl++;
+	}
+
+	return rc;
+}
+
+static int mt9p111_reset(const struct msm_camera_sensor_info *dev)
+{
+	int rc = 0;
+
+	rc = gpio_request(dev->sensor_reset, "mt9p111");
+
+	if (!rc) {
+		rc = gpio_direction_output(dev->sensor_reset, 0);
+		msleep(20);
+        rc = gpio_direction_output(dev->sensor_reset, 1);
+		msleep(20);
+	}
+
+	gpio_free(dev->sensor_reset);
+	return rc;
+}
+
+static long mt9p111_reg_init(void)
+{
+	int rc = 0;
+    
+	MT9P111_DBG("mt9p111_reg_init begin!\n");
+	
+	rc = mt9p111_i2c_write_table(&mt9p111_reg_init_tab[0],
+			ARRAY_SIZE(mt9p111_reg_init_tab));
+	if (rc < 0)
+		return rc;
+
+    MT9P111_DBG("mt9p111_reg_init end!\n");
+
+	return 0;
+}
+
+
+static void sensor_flash_function(unsigned long data)
+{	
+	if (0 == data) {
+		MT9P111_DBG("FLASH!!!!!!!!!!!!!\n");
+		config_camera_ctrl_flash(MT_True);
+		flash_timer.data = 1;
+		mod_timer(&flash_timer, jiffies + HZ/5);	    //200ms;
+	}
+	else {
+		MT9P111_DBG("FLASH OVER!!!!!!!!!!!!!\n");
+		config_camera_ctrl_flash(MT_False);
+	}	
+}
+
+static void sensor_flash_test(unsigned long data)
+{	
+	if (0 == data) {
+		MT9P111_DBG("FLASH!!!!!!!!!!!!!\n");
+		config_camera_ctrl_flash(MT_True);
+		flash_timer.data = 1;
+		mod_timer(&flash_timer, jiffies + HZ/5);	    //200ms;
+		g_isFlash--;
+		MT9P111_DBG("led flash count: %d\n", g_isFlash); 
+	}
+	else {
+		MT9P111_DBG("FLASH OVER!!!!!!!!!!!!!\n");
+		config_camera_ctrl_flash(MT_False);
+		if (g_isFlash) {
+			flash_timer.data = 0;
+			mod_timer(&flash_timer, jiffies + HZ*2);	    //2000ms;
+		}
+	}	
+}
+
+static int mt9p111_set_autofocus(void)
+{
+    int rc = 0;
+	int loop; 
+	uint16_t afok = 0;
+
+	MT9P111_DBG("%s  \n", __func__);  
+    if (!g_AutoFocus)
+        return 0;
+    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_trigger[0],
+			ARRAY_SIZE(mt9p111_reg_af_trigger));
+	if (rc < 0)
+		return rc;
+
+    loop = 40;
+	do {
+		msleep(50);
+        rc = mt9p111_i2c_write(mt9p111_client->addr, REG_MT9P111_ADDR_ACESS, REG_MT9P111_AF_STATUS, WORD_LEN);
+        if (rc < 0)
+		    return rc;
+        
+	    rc = mt9p111_i2c_read(mt9p111_client->addr, REG_MT9P111_AF_STATUS, &afok, WORD_LEN);
+        //MT9P111_DBG("The value of reg REG_MT9P111_AF_STATUS is:0x%x\n",afok);
+        if (rc < 0)
+		    return rc;
+		
+		if (MT9P111_AF_STATUS_OK == afok)
+			return 0;
+	} while(loop--);
+    //} while((afok & 0x0010) == 0);
+	printk(KERN_WARNING "mt9p111: AF timeout in 2s\n");
+	return 0;
+}
+
+static int mt9p111_set_af_rect(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_afrect)  
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+            case SPOT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_rect_spot[0],
+			            ARRAY_SIZE(mt9p111_reg_af_rect_spot));
+                break;
+		    case CENTER_WEIGHTED:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_rect_center[0],
+			            ARRAY_SIZE(mt9p111_reg_af_rect_center));
+			    break;
+            case AVERAGE:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_rect_average[0],
+			            ARRAY_SIZE(mt9p111_reg_af_rect_average));
+			    break;
+            case AUTO:
+                rc = mt9p111_i2c_write_table(&mt9p111_reg_af_rect_average[0],
+			            ARRAY_SIZE(mt9p111_reg_af_rect_average));
+                break;
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_rect_average[0],
+			            ARRAY_SIZE(mt9p111_reg_af_rect_average));
+			    break;
+	    }
+        mt9p111_effect = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_af_ops(u32 value)
+{
+    int rc = 0;
+
+    if(value != mt9p111_afops)
+    {
+        MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+            case AF_MODE_FULLSCAN:
+                g_AutoFocus = MT_True;
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_scan[0],
+			            ARRAY_SIZE(mt9p111_reg_af_scan));
+                break;
+		    case AF_MODE_CONTINUOUS:
+                g_AutoFocus = MT_False;
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_continuous[0],
+			            ARRAY_SIZE(mt9p111_reg_af_continuous));
+			    break;
+            case AF_MODE_MACRO:
+                g_AutoFocus = MT_False;
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_micro[0],
+			            ARRAY_SIZE(mt9p111_reg_af_micro));
+			    break;
+		    case AF_MODE_INFINITY:
+                g_AutoFocus = MT_False;
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_af_infinity[0],
+			            ARRAY_SIZE(mt9p111_reg_af_infinity));
+			    break;
+            case AF_MODE_AUTO:
+			    g_AutoFocus = MT_True;
+                rc = mt9p111_i2c_write_table(&mt9p111_reg_af_scan[0],
+			            ARRAY_SIZE(mt9p111_reg_af_scan));
+			    break;
+		    default:
+			    g_AutoFocus = MT_True;
+                rc = mt9p111_i2c_write_table(&mt9p111_reg_af_scan[0],
+			            ARRAY_SIZE(mt9p111_reg_af_scan));
+			    break;
+	    }
+        mt9p111_afops = value;
+    }
+
+	return rc;
+}
+
+static int mt9p111_set_flash_mode(int value)
+{
+    //MT9P111_DBG("%s  value=%d\n", __func__, value);
+	switch(value) {
+	case STROBE_FLASH_MODE_OFF:
+		g_flashAuto = MT_False;
+		g_isFlash = MT_False;
+		break;
+	case STROBE_FLASH_MODE_ON:
+		g_flashAuto = MT_False;
+		g_isFlash = MT_True;
+		break;	
+	case STROBE_FLASH_MODE_AUTO:
+		g_flashAuto = MT_True;
+		break;
+	default:
+		g_flashAuto = MT_False;
+        g_isFlash = MT_False;
+		break;						
+	}
+	
+	return 0;
+}
+
+static int mt9p111_set_effect(u32 value)
+{
+    int rc = 0;
+    
+    if(value != mt9p111_effect) 
+    {
+		MT9P111_DBG("%s  value=%d\n", __func__, value);
+        msleep(1000);
+    	switch(value) {
+    	case CAMERA_EFFECT_OFF:
+    		rc = mt9p111_i2c_write_table(&mt9p111_reg_effect_normal[0],
+    			    ARRAY_SIZE(mt9p111_reg_effect_normal));
+    		break;			
+    	case CAMERA_EFFECT_MONO:
+    		rc = mt9p111_i2c_write_table(&mt9p111_reg_effect_mono[0],
+    			    ARRAY_SIZE(mt9p111_reg_effect_mono));
+    		break;			
+    	case CAMERA_EFFECT_NEGATIVE:
+    		rc = mt9p111_i2c_write_table(&mt9p111_reg_effect_negative[0],
+    			    ARRAY_SIZE(mt9p111_reg_effect_negative));
+    		break;						
+    	case CAMERA_EFFECT_SEPIA:
+    		rc = mt9p111_i2c_write_table(&mt9p111_reg_effect_sepia[0],
+    			    ARRAY_SIZE(mt9p111_reg_effect_sepia));
+    		break;			
+    	default:
+    		rc = mt9p111_i2c_write_table(&mt9p111_reg_effect_normal[0],
+    			    ARRAY_SIZE(mt9p111_reg_effect_normal));
+    		break;			
+    	}
+		
+	    mt9p111_effect = value;
+    }
+
+	return rc;
+}
+
+static int mt9p111_set_contrast(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_contrast)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch (value) {
+	    case CAMERA_CONTRAST_0:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_0[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_0));
+		    break;
+	    case CAMERA_CONTRAST_1:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_1[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_1));
+		    break;
+	    case CAMERA_CONTRAST_2:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_2[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_2));
+		    break;
+	    case CAMERA_CONTRAST_3:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_3[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_3));
+		    break;
+	    case CAMERA_CONTRAST_4:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_4[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_4));
+		    break;
+        case CAMERA_CONTRAST_5:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_5[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_5));
+		break;
+        case CAMERA_CONTRAST_6:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_6[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_6));
+		    break;
+	    case CAMERA_CONTRAST_7:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_7[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_7));
+		    break;
+        case CAMERA_CONTRAST_8:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_8[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_8));
+		    break;
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_contrast_0[0],
+			        ARRAY_SIZE(mt9p111_reg_contrast_0));
+		    break;
+	    }
+        mt9p111_contrast = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_brightness(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_brightness)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch (value) {
+	    case CAMERA_BRIGHTNESS_LOWEST:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_0[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_0));
+		    break;
+	    case CAMERA_BRIGHTNESS_LOW:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_1[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_1));
+		    break;
+	    case CAMERA_BRIGHTNESS_MIDDLE: 
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_2[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_2));
+		    break;
+	    case CAMERA_BRIGHTNESS_HIGH:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_3[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_3));
+		    break;
+	    case CAMERA_BRIGHTNESS_HIGHEST:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_4[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_4));
+		    break;
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_brightness_2[0],
+			        ARRAY_SIZE(mt9p111_reg_brightness_2));
+		    break;
+	    }
+        mt9p111_brightness = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_reflect(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_reflect)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch((camera_reflect_type)value) {
+	    case CAMERA_REFLECT_NONE:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_reflect_none[0],
+			        ARRAY_SIZE(mt9p111_reg_reflect_none));
+		    break;
+	    case CAMERA_REFLECT_MIRROR:	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_reflect_mirror[0],
+			        ARRAY_SIZE(mt9p111_reg_reflect_mirror));
+		    break;			
+	    case CAMERA_REFLECT_FLIP:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_reflect_flip[0],
+			        ARRAY_SIZE(mt9p111_reg_reflect_flip));
+		    break;
+	    case CAMERA_REFLECT_MIRROR_FLIP: 	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_reflect_mirror_flip[0],
+			        ARRAY_SIZE(mt9p111_reg_reflect_mirror_flip));
+		    break;			
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_reflect_none[0],
+			        ARRAY_SIZE(mt9p111_reg_reflect_none));
+		    break;				
+	
+	    }
+	    mt9p111_reflect = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_fps(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_fps)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch((camera_fps_type)value) {
+	    case CAMERA_FPS_VARIABLE:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_ficker_fps_variable[0],
+			        ARRAY_SIZE(mt9p111_reg_ficker_fps_variable));
+		    break;
+	    case CAMERA_FPS_8:	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_ficker_fps_8[0],
+			        ARRAY_SIZE(mt9p111_reg_ficker_fps_8));
+		    break;			
+	    case CAMERA_FPS_10:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_ficker_fps_10[0],
+			        ARRAY_SIZE(mt9p111_reg_ficker_fps_10));
+		    break;
+	    case CAMERA_FPS_15: 	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_ficker_fps_15[0],
+			        ARRAY_SIZE(mt9p111_reg_ficker_fps_15));
+		    break;			
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_ficker_fps_variable[0],
+			        ARRAY_SIZE(mt9p111_reg_ficker_fps_variable));
+		    break;				
+	
+	    }
+	    mt9p111_fps = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_antibanding(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_antibanding)
+    {
+        MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch((camera_antibanding_type)value) {
+	    case CAMERA_ANTIBANDING_AUTO:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_autobanding_auto_fd[0],
+			        ARRAY_SIZE(mt9p111_reg_autobanding_auto_fd));
+		    break;
+	    case CAMERA_ANTIBANDING_50HZ:	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_autobanding_manual_fd_50[0],
+			        ARRAY_SIZE(mt9p111_reg_autobanding_manual_fd_50));
+		    break;			
+	    case CAMERA_ANTIBANDING_60HZ:		
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_autobanding_manual_fd_60[0],
+			        ARRAY_SIZE(mt9p111_reg_autobanding_manual_fd_60));
+		    break;
+	    case CAMERA_ANTIBANDING_OFF: 	
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_autobanding_fd_off[0],
+			        ARRAY_SIZE(mt9p111_reg_autobanding_fd_off));
+		    break;			
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_autobanding_auto_fd[0],
+			        ARRAY_SIZE(mt9p111_reg_autobanding_auto_fd));
+		    break;					
+	
+	    }
+        mt9p111_antibanding = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_white_balance(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_white_balance)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);
+	    switch((camera_wb_type)value) {
+	    case CAMERA_WB_AUTO:			/* Auto */
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_auto[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_auto));
+		    break;
+	    case CAMERA_WB_INCANDESCENT:	/* Incandescent */
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_home[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_home));
+		    break;			
+	    case CAMERA_WB_DAYLIGHT:		/* Sunny */
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_sunny[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_sunny));
+		    break;
+	    case CAMERA_WB_FLUORESCENT: 	/* Fluorescent */
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_office[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_office));
+		    break;			
+	    case CAMERA_WB_CLOUDY_DAYLIGHT:	/* ext: Cloudy */
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_cloudy[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_cloudy));
+		    break;
+	    default:
+		    rc = mt9p111_i2c_write_table(&mt9p111_reg_wb_auto[0],
+			        ARRAY_SIZE(mt9p111_reg_wb_auto));
+		    break;				
+	
+	    }
+	    mt9p111_white_balance = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_scene(u32 value)
+{
+    int rc = 0;  
+
+    if(value != mt9p111_scene)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+            case CAMERA_BESTSHOT_OFF:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_auto[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_auto));
+			    break;
+		    case CAMERA_BESTSHOT_PORTRAIT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_portrait[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_portrait));
+			    break;
+            case CAMERA_BESTSHOT_LANDSCAPE:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_landscape[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_landscape));
+			    break;
+		    case CAMERA_BESTSHOT_NIGHT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_night[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_night));
+			    break;
+		    case CAMERA_BESTSHOT_BEACH://CAMERA_BESTSHOT_SNOW
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_beach_snow[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_beach_snow));
+			    break;
+		    case CAMERA_BESTSHOT_SUNDOWN:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_sun_down[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_sun_down));
+			break;
+            case CAMERA_BESTSHOT_SPORTS:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_sports[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_sports));
+			    break;
+            case CAMERA_BESTSHOT_CANDLELIGHT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_candlelight[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_candlelight));
+			    break;
+            case CAMERA_BESTSHOT_FLOWERS:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_text[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_text));
+			    break;
+            case CAMERA_BESTSHOT_SUNSET:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_dawn[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_dawn));
+			    break;
+            case CAMERA_BESTSHOT_BACKLIGHT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_backlight[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_backlight));
+			    break;        
+    
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_scene_auto[0],
+			            ARRAY_SIZE(mt9p111_reg_scene_auto));
+			    break;
+	    }
+        mt9p111_scene = value;
+    }
+
+	return rc;
+}
+
+static int mt9p111_set_exposure_mode(u32 value)
+{
+    int rc = 0;
+
+    if(value != mt9p111_exposure_mode)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+		    case CAMERA_AEC_FRAME_AVERAGE:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_exposure_average[0],
+			            ARRAY_SIZE(mt9p111_reg_exposure_average));
+			    break;
+		    case CAMERA_AEC_CENTER_WEIGHTED:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_exposure_center[0],
+			            ARRAY_SIZE(mt9p111_reg_exposure_center));
+			    break;
+            case CAMERA_AEC_SPOT_METERING:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_exposure_spot[0],
+			            ARRAY_SIZE(mt9p111_reg_exposure_spot));
+			    break; 
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_exposure_average[0],
+			            ARRAY_SIZE(mt9p111_reg_exposure_average));
+			    break;
+	    }
+        mt9p111_exposure_mode = value;
+    }
+
+	return rc;
+}
+
+static int mt9p111_set_exposure_type(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_exposure_type)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+		    case CAMERA_EXPOSURE_N3:
+			    /* -3 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_n3[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_n3));
+			    break;
+		    case CAMERA_EXPOSURE_N2:
+			    /* -2 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_n2[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_n2));
+			    break;
+            case CAMERA_EXPOSURE_N1:
+			    /* -1 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_n1[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_n1));
+			    break;
+            case CAMERA_EXPOSURE_0:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_0[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_0));
+			    break;
+		    case CAMERA_EXPOSURE_1:
+			    /* 1 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_1[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_1));
+			    break;
+		    case CAMERA_EXPOSURE_2:
+			    /* 2 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_2[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_2));
+			    break;
+		    case CAMERA_EXPOSURE_3:
+			    /* 3 EV */
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_3[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_3));
+			    break;
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_ev_0[0],
+			            ARRAY_SIZE(mt9p111_reg_ev_0));
+	            break;
+	    }
+        mt9p111_exposure_type = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_sharpness(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_sharpness)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+        	    case CAMERA_SHARPNESS_DEFAULT:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_default[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_default));
+			    break;
+		    case CAMERA_SHARPNESS_1:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_1[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_1));
+			    break;
+            case CAMERA_SHARPNESS_2:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_2[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_2));
+			    break;
+		    case CAMERA_SHARPNESS_3:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_3[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_3));
+			    break;
+		    case CAMERA_SHARPNESS_4:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_4[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_4));
+			    break;
+		    case CAMERA_SHARPNESS_5:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_5[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_5));
+			    break;
+            case CAMERA_SHARPNESS_6:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_6[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_6));
+			break;
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_sharpness_default[0],
+			            ARRAY_SIZE(mt9p111_reg_sharpness_default));
+			    break;
+	    }
+        mt9p111_sharpness = value;
+    }
+	return rc;
+}
+
+static int mt9p111_set_iso(u32 value)
+{
+    int rc = 0;
+
+    if(value != mt9p111_iso)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+            case CAMERA_ISO_AUTO:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_auto[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_auto));
+                break;
+		    case CAMERA_ISO_DEBLUR:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_50[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_50));
+			    break;
+            case CAMERA_ISO_100:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_100[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_100));
+			    break;
+		    case CAMERA_ISO_200:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_200[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_200));
+			    break;
+		    case CAMERA_ISO_400:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_400[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_400));
+			    break;
+		    case CAMERA_ISO_800:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_800[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_800));
+			    break;
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_iso_auto[0],
+			            ARRAY_SIZE(mt9p111_reg_iso_auto));
+			    break;
+	    }
+        mt9p111_iso = value;
+    }
+
+	return rc;
+}
+
+static int mt9p111_set_saturation(u32 value)
+{
+    int rc = 0;
+    if(value != mt9p111_saturation)
+    {
+	    MT9P111_DBG("%s  value=%d\n", __func__, value);  
+	    switch(value) {
+		    case CAMERA_SATURATION_5:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_5[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_5));
+			    break;
+		    case CAMERA_SATURATION_4:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_4[0],
+			        ARRAY_SIZE(mt9p111_reg_saturation_4));
+			    break;
+            case CAMERA_SATURATION_3:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_3[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_3));
+			    break;
+		    case CAMERA_SATURATION_2:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_2[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_2));
+			    break;
+		    case CAMERA_SATURATION_1:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_1[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_1));
+			    break;
+            case CAMERA_SATURATION_0:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_0[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_0));
+			    break;
+		    case CAMERA_SATURATION_N1:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_n1[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_n1));
+			    break;
+            case CAMERA_SATURATION_N2:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_n2[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_n2));
+			    break;
+		    case CAMERA_SATURATION_N3:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_n3[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_n3));
+			    break;
+		    case CAMERA_SATURATION_N4:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_n4[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_n4));
+			    break;
+		    case CAMERA_SATURATION_N5:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_n5[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_n5));
+			    break;
+		    default:
+			    rc = mt9p111_i2c_write_table(&mt9p111_reg_saturation_0[0],
+			            ARRAY_SIZE(mt9p111_reg_saturation_0));
+			    break;
+	    }
+        mt9p111_saturation  = value;
+    }
+	return rc;
+}
+
+static int32_t mt9p111_sensor_setting(int update_type, int rt)
+{
+	//int32_t i, array_length;
+	int32_t rc = 0;
+	struct msm_camera_csi_params mt9p111_csi_params;
+    //MT9P111_DBG("in %s :\n", __func__);
+	switch (update_type) {
+	case REG_INIT:
+        MT9P111_CSI_CONFIG = 0;
+		rc = mt9p111_reg_init();
+	    if (rc < 0)
+		    return rc;
+		break;
+	case UPDATE_PERIODIC:
+		if (!MT9P111_CSI_CONFIG) {
+            //msm_camio_vfe_clk_rate_set(192000000);
+			mt9p111_csi_params.lane_cnt = 1;
+			mt9p111_csi_params.data_format = CSI_8BIT;
+			mt9p111_csi_params.lane_assign = 0xe4;
+			mt9p111_csi_params.dpcm_scheme = 0;
+			mt9p111_csi_params.settle_cnt = 0x14;
+
+			rc = msm_camio_csi_config(&mt9p111_csi_params);
+			msleep(10);
+
+            rc = mt9p111_i2c_write_table(&mt9p111_reg_mipi_start[0],
+                ARRAY_SIZE(mt9p111_reg_mipi_start));
+				if (rc < 0)
+					return rc;
+            MT9P111_CSI_CONFIG = 1;
+            msleep(10);
+
+			return rc;
+
+		}
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+	return rc;
+
+}
+
+
+static int32_t mt9p111_video_config(int mode)
+{
+	int32_t rc = 0; 
+    int rt;
+	/* change sensor resolution if needed */
+    MT9P111_DBG("set SENSOR_PREVIEW_MODE begin\n");
+       
+    rt = RES_PREVIEW;
+    if (mt9p111_sensor_setting(UPDATE_PERIODIC, rt) < 0)
+		return rc;	
+    
+    rc = mt9p111_i2c_write_table(&mt9p111_reg_preview[0],
+			ARRAY_SIZE(mt9p111_reg_preview));
+	if (rc < 0)
+		return rc;
+    msleep(10);
+
+    MT9P111_DBG("set SENSOR_PREVIEW_MODE end\n");
+    
+	return rc;
+}
+
+static int32_t mt9p111_snapshot_config(int mode)
+{
+    int32_t rc = 0;
+    int rt;
+    uint16_t target_brightness, real_brightness;
+    
+	rt = RES_CAPTURE;    
+    
+    MT9P111_DBG("set SENSOR_SNAPSHOT_MODE begin\n");
+    
+	if (mt9p111_sensor_setting(UPDATE_PERIODIC, rt) < 0)
+		return rc;  
+    
+    //g_flashAuto = MT_True;
+    if (MT_True == g_flashAuto) {
+            rc = mt9p111_i2c_read(mt9p111_client->addr,	REG_MT9P111_TAGET_BRIGHTNESS, 
+                &target_brightness, WORD_LEN);
+            if (rc < 0)
+		        return rc;
+			rc = mt9p111_i2c_read(mt9p111_client->addr,	REG_MT9P111_REAL_BRIGHTNESS, 
+                &real_brightness, WORD_LEN);
+			//MT9P111_DBG("The value of REG_MT9P111_TAGET_BRIGHTNESS is:0x%x REG_MT9P111_REAL_BRIGHTNESS is:0x%x\n",
+            //    target_brightness,real_brightness);
+            if (rc < 0)
+		        return rc;
+            
+			if (real_brightness < target_brightness) {
+                g_isFlash = MT_True;
+			}
+			else {
+                g_isFlash = MT_False;
+			}
+		}
+
+    //g_isFlash = MT_True;
+    if (MT_True == g_isFlash) {
+			flash_timer.function = sensor_flash_function;
+			flash_timer.expires = jiffies + HZ*111/100;
+			flash_timer.data = 0;
+			add_timer(&flash_timer);	    
+	}    
+    
+    rc = mt9p111_i2c_write_table(&mt9p111_reg_capture[0], ARRAY_SIZE(mt9p111_reg_capture));
+	if (rc < 0)
+		return rc;
+    
+    MT9P111_DBG("set SENSOR_SNAPSHOT_MODE end\n");
+
+    return rc;
+}
+
+static int32_t mt9p111_raw_snapshot_config(int mode)
+{
+	int32_t rc = 0;
+	int rt;
+	rt = RES_CAPTURE;	
+    
+    MT9P111_DBG("set SENSOR_RAW_SNAPSHOT_MODE begin\n");
+    
+    if (mt9p111_sensor_setting(UPDATE_PERIODIC, rt) < 0)
+		return rc;
+       
+    MT9P111_DBG("set SENSOR_RAW_SNAPSHOT_MODE end\n");
+
+	return rc;
+}
+
+static int32_t mt9p111_set_sensor_mode(int mode)
+{
+	int32_t rc = 0;
+    //MT9P111_DBG("in %s :\n", __func__);
+	switch (mode) {
+	case SENSOR_PREVIEW_MODE:
+		rc = mt9p111_video_config(mode);
+		break;
+	case SENSOR_SNAPSHOT_MODE:
+		rc = mt9p111_snapshot_config(mode);
+		break;
+	case SENSOR_RAW_SNAPSHOT_MODE:
+		rc = mt9p111_raw_snapshot_config(mode);
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+    
+	return rc;
+}
+
+static int mt9p111_sensor_init_probe(const struct msm_camera_sensor_info *data)
+{
+	uint16_t model_id = 0;
+	int rc = 0;
+
+	MT9P111_DBG("mt9p111_sensor_init_probe entry \n");
+
+    rc = mt9p111_reset(data);
+	if (rc < 0) {
+		printk(KERN_ERR "reset failed!\n");
+		goto init_probe_fail;
+	}
+
+	msleep(5);
+
+    rc = mt9p111_i2c_read(mt9p111_client->addr,	REG_MT9P111_MODEL_ID, &model_id, WORD_LEN);
+    if (rc < 0)
+	    goto init_probe_fail;   
+    
+	/* Check to make sure we are working with an mt9p111 */
+	if (model_id != MT9P111_MODEL_ID) {
+		printk(KERN_ERR "mt9p111: pid(0x%x) is not correct!\n", model_id);
+		//mdelay(10);
+	}
+    
+    printk(KERN_INFO "The value of mt9p111 ID is:0x%x\n", model_id);
+
+	return rc;
+
+init_probe_fail:
+    printk(KERN_ERR "mt9p111_sensor_init_probe failed!\n");
+	return rc;
+}
+
+int mt9p111_sensor_init(const struct msm_camera_sensor_info *data)
+{
+	int rc = 0;
+    
+    MT9P111_DBG("mt9p111_sensor_init entry!\n");
+	mt9p111_ctrl = kzalloc(sizeof(struct mt9p111_ctrl), GFP_KERNEL);
+	if (!mt9p111_ctrl) {
+		printk(KERN_ERR "mt9p111_init failed!\n");
+		rc = -ENOMEM;
+		goto init_done;
+	}
+
+	if (data)
+		mt9p111_ctrl->sensordata = data;
+
+    /* Input MCLK = 24MHz */
+	msm_camio_clk_rate_set(24000000);
+	msleep(5);
+
+	rc = mt9p111_sensor_init_probe(data);
+	if (rc < 0) {
+		printk(KERN_ERR "mt9p111_sensor_init failed!\n");
+		goto init_fail;
+	}
+
+    //rc = mt9p111_reg_init();
+    rc = mt9p111_sensor_setting(REG_INIT, RES_PREVIEW);
+    if (rc < 0)
+		goto init_fail;
+
+    init_timer(&flash_timer);
+    
+init_done:
+	return rc;
+
+init_fail:
+	kfree(mt9p111_ctrl);
+	return rc;
+}
+
+static int mt9p111_init_client(struct i2c_client *client)
+{
+	/* Initialize the MSM_CAMI2C Chip */
+	init_waitqueue_head(&mt9p111_wait_queue);
+	return 0;
+}
+
+int mt9p111_sensor_config(void __user *argp)
+{
+	struct sensor_cfg_data cfg_data;
+	long   rc = 0;
+   
+	if (copy_from_user(&cfg_data,
+			(void *)argp,
+			sizeof(struct sensor_cfg_data)))
+		return -EFAULT;
+
+	/* down(&mt9p111_sem); */
+
+	//MT9P111_DBG("mt9p111_ioctl, cfgtype = %d, mode = %d\n",
+	//	cfg_data.cfgtype, cfg_data.mode);
+    mutex_lock(&mt9p111_mut);
+	switch (cfg_data.cfgtype) {
+	case CFG_SET_MODE:
+		rc = mt9p111_set_sensor_mode(cfg_data.mode);
+		break;
+
+	case CFG_SET_EFFECT:
+		rc = mt9p111_set_effect(cfg_data.cfg.effect);
+		break;
+
+    case CFG_SET_BRIGHTNESS:
+		 rc = mt9p111_set_brightness(cfg_data.cfg.brightness);
+		 break;
+
+	case CFG_SET_CONTRAST:
+		 rc = mt9p111_set_contrast(cfg_data.cfg.contrast);
+		 break;
+
+	case CFG_SET_WB:
+		 rc = mt9p111_set_white_balance(cfg_data.cfg.wb);
+		 break;
+         
+    case CFG_SET_DEFAULT_FOCUS:
+		rc = mt9p111_set_autofocus();
+		break;
+
+	case CFG_SET_FLASH_MODE:
+		rc = mt9p111_set_flash_mode(cfg_data.cfg.flash);
+		break;
+        
+    case CFG_SET_EXPOSURE_MODE:
+		rc = mt9p111_set_exposure_mode(cfg_data.cfg.exposuremode);		
+		break;
+        
+    case CFG_SET_EXPOSURE_TYPE:
+		rc = mt9p111_set_exposure_type(cfg_data.cfg.exposuretype);		
+		break;
+
+    case CFG_SET_SCENE_MODE:
+		rc = mt9p111_set_scene(cfg_data.cfg.scene);
+		break; 
+        
+    case CFG_SET_ISO_MODE:
+		rc = mt9p111_set_iso(cfg_data.cfg.iso);
+		break;
+
+    case CFG_SET_SHARPNESS_MODE:
+		rc = mt9p111_set_sharpness(cfg_data.cfg.sharpness);
+		break;  
+        
+    case CFG_SET_SATURATION_MODE:
+		rc = mt9p111_set_saturation(cfg_data.cfg.saturation);
+		break;
+        
+    case CFG_SET_AF_RECT_MODE:
+        rc = mt9p111_set_af_rect(cfg_data.cfg.afrect);
+		break;
+        
+    case CFG_SET_ANTIBANDING:
+        rc = mt9p111_set_antibanding(cfg_data.cfg.antibanding);
+		break;
+
+    case CFG_SET_FPS:
+        rc = mt9p111_set_fps(cfg_data.cfg.p_fps);
+		break;
+        
+    case CFG_SET_REFLECT_MODE:
+        rc = mt9p111_set_reflect(cfg_data.cfg.reflect);
+		break;
+
+    case CFG_SET_AF_OPS_MODE:
+        rc = mt9p111_set_af_ops(cfg_data.cfg.afops);
+		break;
+        
+	case CFG_GET_AF_MAX_STEPS:
+	default:
+		rc = -EINVAL;
+		break;
+	}
+    
+    mutex_unlock(&mt9p111_mut);
+	/* up(&mt9p111_sem); */
+
+	return rc;
+}
+
+//int mt9p111_sensor_release(const struct msm_camera_sensor_info *data)
+int mt9p111_sensor_release(void)
+{
+	int rc = 0;
+    MT9P111_DBG("%s  =\n", __func__);  
+    mutex_lock(&mt9p111_mut);
+    gpio_set_value(mt9p111_ctrl->sensordata->sensor_reset, 0);
+    msleep(5);
+	/* down(&mt9p111_sem); */
+	kfree(mt9p111_ctrl);
+    mt9p111_ctrl = NULL;
+	/* up(&mt9p111_sem); */
+    del_timer(&flash_timer);
+    mutex_unlock(&mt9p111_mut);
+    
+	return rc;
+}
+
+static ssize_t mt9p111attr_testled_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return 0;
+}
+
+static ssize_t mt9p111attr_testled_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t n)
+{
+	int val = 0;
+	
+	sscanf(buf, "%d", &val);
+	
+	MT9P111_DBG("flash times is %d\n", val);
+	if (val <= 0) {
+        printk(KERN_ERR "invalid input\n");
+	}
+	else {
+		g_isFlash = val;		
+		init_timer(&flash_timer);		
+		flash_timer.function = sensor_flash_test;
+		flash_timer.expires = jiffies + HZ/10;
+		flash_timer.data = 0;
+		add_timer(&flash_timer);	 		
+	}
+	
+	return n;
+}
+
+static DEVICE_ATTR(testled, S_IRUGO|S_IWUSR, mt9p111attr_testled_show, mt9p111attr_testled_store);
+
+
+static ssize_t mt9p111attr_flashled_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", g_isFlash);
+}
+
+static ssize_t mt9p111attr_flashled_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t n)
+{
+	int val;
+	sscanf(buf, "%d", &val);
+	if (val != 1) {
+        printk(KERN_ERR "invalid input\n");
+	}
+	else {
+		g_isFlash = val;
+
+		if(g_isFlash==MT_True) {
+			init_timer(&flash_timer);
+			flash_timer.function = sensor_flash_function;
+			flash_timer.expires = jiffies + HZ/10;
+			flash_timer.data = 0;
+			add_timer(&flash_timer);	    
+		}
+	}
+	
+	return n;
+}
+
+static DEVICE_ATTR(flashled, S_IRWXUGO, mt9p111attr_flashled_show, mt9p111attr_flashled_store);
+
+//echo 1 > /sys/devices/i2c-4/4-003c/flashled
+//echo 100 > /sys/devices/i2c-4/4-003c/testled
+
+static struct attribute *mt9p111_sysfs_attr[] = {
+	&dev_attr_flashled.attr,
+	&dev_attr_testled.attr,
+	NULL
+};
+
+static int mt9p111_sysfs_add(struct kobject *kobj)
+{
+	int i, n, ret;
+	n = ARRAY_SIZE(mt9p111_sysfs_attr);
+	for (i = 0; i < n; ++i) {
+		if (mt9p111_sysfs_attr[i]) {
+			ret = sysfs_create_file(kobj, mt9p111_sysfs_attr[i]);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+
+static int mt9p111_i2c_probe(struct i2c_client *client,
+	const struct i2c_device_id *id)
+{
+	int rc = 0;
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		rc = -ENOTSUPP;
+		goto probe_failure;
+	}
+
+	mt9p111_sensorw =
+		kzalloc(sizeof(struct mt9p111_work), GFP_KERNEL);
+
+	if (!mt9p111_sensorw) {
+		rc = -ENOMEM;
+		goto probe_failure;
+	}
+
+	i2c_set_clientdata(client, mt9p111_sensorw);
+	mt9p111_init_client(client);
+	mt9p111_client = client;
+    mt9p111_sysfs_add(&client->dev.kobj);
+
+	MT9P111_DBG("mt9p111_i2c_probe succeeded!\n");
+
+	return 0;
+
+probe_failure:
+	kfree(mt9p111_sensorw);
+	mt9p111_sensorw = NULL;
+	printk(KERN_ERR "mt9p111_probe failed!\n");
+	return rc;
+}
+
+static const struct i2c_device_id mt9p111_i2c_id[] = {
+	{ "mt9p111", 0},
+	{ },
+};
+
+static struct i2c_driver mt9p111_i2c_driver = {
+	.id_table = mt9p111_i2c_id,
+	.probe  = mt9p111_i2c_probe,
+	.remove = __exit_p(mt9p111_i2c_remove),
+	.driver = {
+		.name = "mt9p111",
+	},
+};
+
+static int mt9p111_sensor_probe(const struct msm_camera_sensor_info *info,
+				struct msm_sensor_ctrl *s)
+{
+	int rc = i2c_add_driver(&mt9p111_i2c_driver);
+	if (rc < 0 || mt9p111_client == NULL) {
+		rc = -ENOTSUPP;
+		goto probe_done;
+	}
+    
+	/* Input MCLK = 24MHz */
+	msm_camio_clk_rate_set(24000000);
+	msleep(5);
+    
+    MT9P111_DBG("mt9p111_sensor_probe!\n");
+    
+	rc = mt9p111_sensor_init_probe(info);
+	if (rc < 0)
+		goto probe_done;
+    
+	s->s_init = mt9p111_sensor_init;
+	s->s_release = mt9p111_sensor_release;
+	s->s_config  = mt9p111_sensor_config;
+/*        s->s_camera_type = BACK_CAMERA_2D;
+	s->s_mount_angle  = 0;
+*/
+
+probe_done:
+	printk(KERN_ERR "%s %s:%d\n", __FILE__, __func__, __LINE__);
+    
+	return rc;
+}
+
+static int __mt9p111_probe(struct platform_device *pdev)
+{
+	return msm_camera_drv_start(pdev, mt9p111_sensor_probe);
+}
+
+static struct platform_driver msm_camera_driver = {
+	.probe = __mt9p111_probe,
+	.driver = {
+		.name = "msm_camera_mt9p111",
+		.owner = THIS_MODULE,
+	},
+};
+
+static int __init mt9p111_init(void)
+{
+	return platform_driver_register(&msm_camera_driver);
+}
+
+module_init(mt9p111_init);

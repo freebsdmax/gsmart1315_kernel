@@ -1,0 +1,1 @@
+cmd_drivers/input/touchscreen/built-in.o :=  /media/android_source/CyanogenMod/system/prebuilt/linux-x86/toolchain/arm-eabi-4.4.0/bin/arm-eabi-ld -EL    -r -o drivers/input/touchscreen/built-in.o drivers/input/touchscreen/ft5202.o drivers/input/touchscreen/msm_qrd_touch_22.o 
